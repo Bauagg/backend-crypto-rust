@@ -6,9 +6,9 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
-use super::candle_repository::insert_candle;
-use super::types::RawKlineEvent;
+use super::repository::insert_candle;
 use crate::services::flex_params::repository::find_flex_params_by_type;
+use crate::services::market::types::RawKlineEvent;
 
 const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
 /// Strategi swing trading kamu pakai timeframe 1D — collector fokus kumpulkan candle harian.

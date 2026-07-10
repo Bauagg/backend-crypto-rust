@@ -58,7 +58,6 @@ pub async fn get_json_with_headers<T: DeserializeOwned>(
 }
 
 /// POST dengan body JSON, hasil JSON di-deserialize ke tipe `T`.
-#[allow(dead_code)]
 pub async fn post_json<T: DeserializeOwned>(
     url: &str,
     headers: Headers,

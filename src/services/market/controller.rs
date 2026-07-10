@@ -4,8 +4,7 @@ use axum::{
 };
 use sqlx::PgPool;
 
-use super::candle_repository::find_candles;
-use super::service::{get_klines_service, get_symbols_service};
+use super::service::{get_klines_service, get_symbols_service, get_top_signals_live_service};
 use super::types::{is_valid_interval, KlinesQuery, SymbolsQuery, WsKlineQuery};
 use super::websocket::relay_kline_stream;
 use crate::utils::api_response::{paginated, success, PaginationParams};
@@ -75,24 +74,19 @@ pub async fn ws_klines(
     Ok(ws.on_upgrade(move |socket| relay_kline_stream(socket, symbol, interval)))
 }
 
-/// Baca data historis dari `market_candles` (dikumpulkan sendiri oleh background collector,
-/// bukan proxy live ke Tokocrypto) — cocok untuk export dataset training ML.
-pub async fn get_stored_candles(
-    State(pool): State<PgPool>,
-    Query(query): Query<KlinesQuery>,
-) -> Result<Response, AppError> {
-    if query.symbol.trim().is_empty() {
-        return Err(AppError::BadRequest("symbol wajib diisi".to_string()));
-    }
+/// 10 sinyal BUY terbaik dievaluasi untuk SEMUA simbol aktif di `flex_params` (bukan cuma
+/// coin yang model sudah dilatih), pakai data live `market_candles` kita sendiri via `/score-live`.
+pub async fn get_top_signals_live(State(pool): State<PgPool>) -> Result<Response, AppError> {
+    let mut tx = begin_tx(&pool).await?;
 
-    let interval = query.interval.unwrap_or_else(|| "1d".to_string());
-    if !is_valid_interval(&interval) {
-        return Err(AppError::BadRequest("interval tidak valid".to_string()));
-    }
+    let result = match get_top_signals_live_service(&pool, &mut tx).await {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
 
-    let limit = query.limit.unwrap_or(500).clamp(1, 5000) as i64;
-    let symbol = query.symbol.trim().to_uppercase();
-
-    let candles = find_candles(&pool, &symbol, &interval, limit).await?;
-    Ok(success(candles, "Berhasil mengambil data candle tersimpan"))
+    commit_tx(tx).await?;
+    Ok(success(result, "Berhasil mengevaluasi sinyal live untuk semua simbol aktif"))
 }
