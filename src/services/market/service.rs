@@ -1,45 +1,72 @@
-use futures_util::future::join_all;
+use chrono::Timelike;
+use deadpool_redis::redis::AsyncCommands;
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::HashMap;
 
+use super::repository;
 use super::types::{
-    is_valid_interval, Candle, KlinesQuery, MarketSymbol, OhlcvBar, ScoreLiveRequest,
-    ScoreLiveResponse, Ticker24hr, TopSignal, ALLOWED_INTERVALS,
+    is_valid_interval, Candle, KlinesQuery, MarketSymbol, RecommendationQuery, ALLOWED_INTERVALS,
 };
-use crate::services::candle_market::service::get_recent_candles_asc_service;
-use crate::services::fear_greed::service::get_fng_map_between_service;
-use crate::services::flex_params::repository::{count_flex_params, find_all_flex_params, find_flex_params_by_type};
+use crate::clients::{binance, strategy_api};
+use crate::database::RedisPool;
+use crate::services::candle_ohlcv::service::get_recent_candles_asc_service;
+use crate::services::flex_params::repository::{count_flex_params, find_all_flex_params};
 use crate::utils::app_error::AppError;
-use crate::utils::http_client::{get_json, post_json};
 
 const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
-const TOP_SIGNALS_COUNT: usize = 10;
-const LIVE_SIGNAL_INTERVAL: &str = "1d";
-/// Minimal bar histori dikirim ke /score-live (API mensyaratkan >=60, idealnya >=200).
-const LIVE_SIGNAL_MIN_BARS: usize = 60;
-const LIVE_SIGNAL_LOOKBACK: i64 = 250;
+/// Cache singkat REST /klines di Redis — bukan pengganti WebSocket (yang tetap real-time),
+/// cuma meredam lonjakan request bersamaan ke exchange saat banyak client buka chart simbol
+/// yang sama dalam waktu berdekatan (mis. reload halaman FE beruntun).
+const KLINES_CACHE_TTL_SECONDS: u64 = 5;
 
-fn api_base_url() -> String {
-    std::env::var("MARKET_API_BASE_URL")
-        .unwrap_or_else(|_| "https://www.tokocrypto.site".to_string())
+/// Ticker 24hr SEMUA simbol dalam 1 request — jauh lebih hemat rate limit dibanding fetch
+/// satu-satu per simbol. `None` kalau request gagal (mis. kena rate limit 429); pemanggil
+/// fallback ke candle tersimpan untuk seluruh halaman kalau ini terjadi.
+async fn fetch_all_tickers() -> Option<HashMap<String, binance::Ticker24hr>> {
+    let tickers = match binance::get_tickers_24hr().await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!("Gagal mengambil ticker 24hr dari exchange: {err:?}");
+            return None;
+        }
+    };
+
+    Some(tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect())
 }
 
-fn strategy_api_base_url() -> String {
-    std::env::var("STRATEGY_API_BASE_URL").unwrap_or_else(|_| "http://localhost:8001".to_string())
-}
+/// Hitung `last_price` & `price_change_percent` dari 2 candle harian terakhir yang sudah kita
+/// simpan sendiri di `candle_ohlcv` (dikumpulkan `worker`) — dipakai sebagai
+/// fallback kalau bulk ticker exchange gagal (mis. kena rate limit), supaya tidak langsung
+/// jatuh ke "0" selama kita masih punya histori candle simbol tersebut.
+async fn fallback_price_from_candles(pool: &PgPool, symbol: &str) -> Option<(String, String)> {
+    let candles = get_recent_candles_asc_service(pool, symbol, "1d", 2).await.ok()?;
+    let last = candles.last()?;
+    let last_price = last.close;
 
-async fn fetch_ticker(symbol: &str) -> Option<Ticker24hr> {
-    let base_url = api_base_url();
-    let url = format!("{base_url}/api/v3/ticker/24hr?symbol={symbol}");
-    get_json::<Ticker24hr>(&url).await.ok()
+    let price_change_percent = match candles.len() {
+        2 => {
+            let prev = candles.first()?.close;
+            if prev.is_zero() {
+                rust_decimal::Decimal::ZERO
+            } else {
+                (last_price - prev) / prev * rust_decimal::Decimal::ONE_HUNDRED
+            }
+        }
+        _ => rust_decimal::Decimal::ZERO,
+    };
+
+    Some((last_price.to_string(), price_change_percent.round_dp(2).to_string()))
 }
 
 /// Daftar pair diambil dari `flex_params` (type_param=SIMBOL_CRYPTO) — diedit lewat endpoint
 /// flex-params yang sudah ada, bukan hardcode di kode. Hanya pair yang `is_active` yang ditampilkan,
-/// bisa difilter dengan search (partial match ke symbol) dan dipaginasi. Untuk tiap pair yang
-/// masuk halaman ini, harga & persentase naik/turun 24 jam di-fetch on-demand dari Tokocrypto secara paralel.
+/// bisa difilter dengan search (partial match ke symbol) dan dipaginasi. Harga & persentase naik/turun
+/// 24 jam diambil dari 1 kali fetch bulk semua simbol (bukan per simbol) supaya hemat rate limit;
+/// kalau bulk fetch itu gagal, fallback ke candle harian tersimpan sendiri (bisa basi s/d 1 hari,
+/// tapi jauh lebih berguna daripada "0").
 pub async fn get_symbols_service(
+    pool: &PgPool,
     tx: &mut Transaction<'_, Postgres>,
     search: Option<&str>,
     limit: i64,
@@ -49,35 +76,56 @@ pub async fn get_symbols_service(
         find_all_flex_params(tx, Some(SYMBOL_TYPE_PARAM), search, true, limit, offset).await?;
     let total = count_flex_params(tx, Some(SYMBOL_TYPE_PARAM), search, true).await?;
 
-    let tickers = join_all(
-        flex_params
-            .iter()
-            .map(|fp| fetch_ticker(&fp.value_param)),
-    )
-    .await;
+    let tickers = fetch_all_tickers().await.unwrap_or_default();
 
-    let symbols = flex_params
-        .into_iter()
-        .zip(tickers)
-        .map(|(fp, ticker)| {
-            let (last_price, price_change_percent) = match ticker {
-                Some(t) => (t.last_price, t.price_change_percent),
+    let mut symbols = Vec::with_capacity(flex_params.len());
+    for fp in flex_params {
+        let (last_price, price_change_percent) = match tickers.get(&fp.value_param) {
+            Some(t) => (t.last_price.clone(), t.price_change_percent.clone()),
+            None => match fallback_price_from_candles(pool, &fp.value_param).await {
+                Some(price) => price,
                 None => ("0".to_string(), "0".to_string()),
-            };
+            },
+        };
 
-            MarketSymbol {
-                symbol: fp.value_param,
-                photo_url: fp.photo_url,
-                last_price,
-                price_change_percent,
-            }
-        })
-        .collect();
+        symbols.push(MarketSymbol {
+            symbol: fp.value_param,
+            photo_url: fp.photo_url,
+            last_price,
+            price_change_percent,
+        });
+    }
 
     Ok((symbols, total))
 }
 
-pub async fn get_klines_service(query: KlinesQuery) -> Result<Vec<Candle>, AppError> {
+/// Key cache Redis unik per kombinasi parameter — beda parameter harus beda hasil, tidak boleh
+/// saling menimpa cache satu sama lain.
+fn klines_cache_key(symbol: &str, interval: &str, limit: u16, end_time: Option<i64>) -> String {
+    format!(
+        "klines:{symbol}:{interval}:{limit}:{}",
+        end_time.map(|t| t.to_string()).unwrap_or_default()
+    )
+}
+
+async fn fetch_klines(
+    symbol: &str,
+    interval: &str,
+    limit: u16,
+    end_time: Option<i64>,
+) -> Result<Vec<Candle>, AppError> {
+    let klines = binance::get_klines(symbol, interval, limit, None, end_time).await?;
+    Ok(klines.into_iter().map(Candle::from).collect())
+}
+
+/// Data chart. Halaman histori (`end_time` diisi) dilayani dari cache rentang (`repository`) yang
+/// dipakai bersama semua user & semua panjang rentang. Halaman terbaru diambil dari Redis kalau ada
+/// stream live aktif (`stream_hub`); kalau tidak, dari exchange dengan cache per request 5 detik —
+/// candle closed-nya tetap ikut mengisi cache rentang.
+pub async fn get_klines_service(
+    redis: &RedisPool,
+    query: KlinesQuery,
+) -> Result<Vec<Candle>, AppError> {
     if query.symbol.trim().is_empty() {
         return Err(AppError::BadRequest("symbol wajib diisi".to_string()));
     }
@@ -93,165 +141,156 @@ pub async fn get_klines_service(query: KlinesQuery) -> Result<Vec<Candle>, AppEr
     let limit = query.limit.unwrap_or(500).clamp(1, 1000);
     let symbol = query.symbol.trim().to_uppercase();
 
-    let base_url = api_base_url();
-    let mut url = format!(
-        "{base_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    );
-    if let Some(end_time) = query.end_time {
-        url.push_str(&format!("&endTime={end_time}"));
+    match query.end_time {
+        Some(end_time) if repository::interval_ms(&interval).is_some() => {
+            get_history_klines(redis, &symbol, &interval, limit, end_time).await
+        }
+        end_time => get_latest_klines(redis, &symbol, &interval, limit, end_time).await,
+    }
+}
+
+async fn get_history_klines(
+    redis: &RedisPool,
+    symbol: &str,
+    interval: &str,
+    limit: u16,
+    end_time: i64,
+) -> Result<Vec<Candle>, AppError> {
+    if let Some(candles) = repository::read_range(redis, symbol, interval, end_time, limit).await {
+        return Ok(candles);
     }
 
-    let raw: Vec<Value> = get_json(&url).await?;
+    // Banyak user minta rentang yang sama bersamaan -> cuma 1 yang ke exchange, sisanya menunggu.
+    let locked = repository::try_lock(redis, symbol, interval, end_time, limit).await;
+    if !locked {
+        if let Some(candles) =
+            repository::wait_for_range(redis, symbol, interval, end_time, limit).await
+        {
+            return Ok(candles);
+        }
+    }
 
-    let candles = raw
-        .into_iter()
-        .filter_map(|row| {
-            let row = row.as_array()?;
-            Some(Candle {
-                open_time: row.first()?.as_i64()?,
-                open: row.get(1)?.as_str()?.to_string(),
-                high: row.get(2)?.as_str()?.to_string(),
-                low: row.get(3)?.as_str()?.to_string(),
-                close: row.get(4)?.as_str()?.to_string(),
-                volume: row.get(5)?.as_str()?.to_string(),
-                close_time: row.get(6)?.as_i64()?,
-                is_closed: true,
-            })
-        })
-        .collect();
+    let result = fetch_klines(symbol, interval, limit, Some(end_time)).await;
+    if let Ok(candles) = &result {
+        let reached_listing_start = candles.len() < limit as usize;
+        repository::store_closed(redis, symbol, interval, candles, reached_listing_start).await;
+    }
+    if locked {
+        repository::unlock(redis, symbol, interval, end_time, limit).await;
+    }
+    result
+}
+
+async fn get_latest_klines(
+    redis: &RedisPool,
+    symbol: &str,
+    interval: &str,
+    limit: u16,
+    end_time: Option<i64>,
+) -> Result<Vec<Candle>, AppError> {
+    // Ada client yang sedang membuka chart ini -> stream hub menjaga candle live & histori di
+    // Redis tetap terbaru, jadi tidak perlu ke exchange sama sekali.
+    if end_time.is_none() {
+        if let Some(candles) = repository::read_latest(redis, symbol, interval, limit).await {
+            return Ok(candles);
+        }
+    }
+
+    let cache_key = klines_cache_key(symbol, interval, limit, end_time);
+
+    if let Ok(mut conn) = redis.get().await {
+        if let Ok(Some(cached)) = conn.get::<_, Option<String>>(&cache_key).await {
+            if let Ok(candles) = serde_json::from_str::<Vec<Candle>>(&cached) {
+                return Ok(candles);
+            }
+        }
+    }
+
+    let candles = fetch_klines(symbol, interval, limit, end_time).await?;
+
+    // Cache best-effort: gagal simpan (Redis down, dll) tidak boleh menggagalkan response.
+    if let Ok(mut conn) = redis.get().await {
+        if let Ok(serialized) = serde_json::to_string(&candles) {
+            let _: Result<(), _> = conn
+                .set_ex(&cache_key, serialized, KLINES_CACHE_TTL_SECONDS)
+                .await;
+        }
+    }
+    let reached_listing_start = candles.len() < limit as usize;
+    repository::store_closed(redis, symbol, interval, &candles, reached_listing_start).await;
 
     Ok(candles)
 }
 
-fn to_decimal_f64(d: rust_decimal::Decimal) -> f64 {
-    d.to_string().parse().unwrap_or(0.0)
+
+const MIN_RECOMMENDATION_LIMIT: u8 = 5;
+const MAX_RECOMMENDATION_LIMIT: u8 = 10;
+/// Rekomendasi cuma berubah sekali sehari (setelah candle harian close 00:00 UTC), tapi cache
+/// dibatasi maksimal 1 jam supaya kalau candle telat masuk, rekomendasi basi tidak bertahan lama.
+const RECOMMENDATION_MAX_CACHE_SECONDS: u64 = 60 * 60;
+/// Rekomendasi tanggal tertentu (histori) tidak akan berubah lagi.
+const RECOMMENDATION_PAST_DATE_CACHE_SECONDS: u64 = 24 * 60 * 60;
+/// Candle harian sudah masuk DB ±00:01 UTC (worker candle) — cache rekomendasi "terbaru" dibuang
+/// paling lambat jam segini supaya hari baru langsung dihitung ulang.
+const RECOMMENDATION_REFRESH_UTC_MINUTE: u32 = 5;
+
+fn recommendation_cache_key(limit: u8, date: Option<&str>) -> String {
+    format!("recommendations:momentum:{limit}:{}", date.unwrap_or("latest"))
 }
 
-/// Susun body /score-live untuk 1 simbol dari histori `market_candles` kita sendiri (data live
-/// Tokocrypto, bukan Binance) + histori BTC (relative strength) + histori FNG — lalu skor via API ML.
-/// `None` kalau data historis simbol ini belum cukup (data baru mulai dikumpulkan collector/backfill).
-async fn score_symbol_live(pool: &PgPool, symbol: &str) -> Option<ScoreLiveResponse> {
-    let coin_candles = get_recent_candles_asc_service(pool, symbol, LIVE_SIGNAL_INTERVAL, LIVE_SIGNAL_LOOKBACK)
-        .await
-        .ok()?;
-    if coin_candles.len() < LIVE_SIGNAL_MIN_BARS {
-        return None;
-    }
-
-    let btc_candles = get_recent_candles_asc_service(pool, "BTCUSDT", LIVE_SIGNAL_INTERVAL, LIVE_SIGNAL_LOOKBACK)
-        .await
-        .ok()?;
-
-    // hanya pakai tanggal yang tersedia di KEDUA sisi (coin & BTC) supaya index-nya sejajar
-    let btc_close_by_date: HashMap<i64, f64> = btc_candles
-        .iter()
-        .map(|c| (c.open_time, to_decimal_f64(c.close)))
-        .collect();
-
-    let coin_candles: Vec<_> = coin_candles
-        .into_iter()
-        .filter(|c| btc_close_by_date.contains_key(&c.open_time))
-        .collect();
-    if coin_candles.len() < LIVE_SIGNAL_MIN_BARS {
-        return None;
-    }
-
-    let start_date = chrono::DateTime::from_timestamp_millis(coin_candles.first()?.open_time)?.date_naive();
-    let end_date = chrono::DateTime::from_timestamp_millis(coin_candles.last()?.open_time)?.date_naive();
-    let fng_rows = get_fng_map_between_service(pool, start_date, end_date).await.ok()?;
-    let fng_by_date: HashMap<chrono::NaiveDate, f64> = fng_rows
-        .into_iter()
-        .map(|(date, value)| (date, value as f64))
-        .collect();
-
-    let mut coin_ohlcv = Vec::with_capacity(coin_candles.len());
-    let mut btc_close = Vec::with_capacity(coin_candles.len());
-    let mut fng = Vec::with_capacity(coin_candles.len());
-
-    for candle in &coin_candles {
-        let date = chrono::DateTime::from_timestamp_millis(candle.open_time)?.date_naive();
-        // FNG hari itu belum tentu ada (mis. cache belum di-refresh) -> pakai nilai netral 50
-        // daripada gagalkan seluruh simbol karena satu bar tidak lengkap.
-        let fng_value = fng_by_date.get(&date).copied().unwrap_or(50.0);
-
-        coin_ohlcv.push(OhlcvBar {
-            date: date.to_string(),
-            open: to_decimal_f64(candle.open),
-            high: to_decimal_f64(candle.high),
-            low: to_decimal_f64(candle.low),
-            close: to_decimal_f64(candle.close),
-            volume: to_decimal_f64(candle.volume),
-        });
-        btc_close.push(*btc_close_by_date.get(&candle.open_time)?);
-        fng.push(fng_value);
-    }
-
-    let base_url = strategy_api_base_url();
-    let url = format!("{base_url}/score-live");
-    let request = ScoreLiveRequest {
-        symbol: symbol.to_string(),
-        coin_ohlcv,
-        btc_close,
-        fng,
+/// Detik sampai 00:05 UTC berikutnya, maksimal `RECOMMENDATION_MAX_CACHE_SECONDS`.
+fn latest_recommendation_cache_seconds() -> u64 {
+    let seconds_today = chrono::Utc::now().num_seconds_from_midnight() as i64;
+    let refresh_at = (RECOMMENDATION_REFRESH_UTC_MINUTE * 60) as i64;
+    let until_refresh = if seconds_today < refresh_at {
+        refresh_at - seconds_today
+    } else {
+        24 * 60 * 60 - seconds_today + refresh_at
     };
-
-    post_json::<ScoreLiveResponse>(&url, Vec::new(), &request)
-        .await
-        .ok()
+    (until_refresh.max(1) as u64).min(RECOMMENDATION_MAX_CACHE_SECONDS)
 }
 
-/// Evaluasi SEMUA simbol aktif di `flex_params` (bukan cuma coin yang model-nya sudah dilatih
-/// data historisnya) via `/score-live` — model ML dikirimi histori OHLCV mentah dari
-/// `market_candles` kita sendiri (data live Tokocrypto), jadi generik untuk simbol mana pun
-/// asal punya histori cukup (>=60 hari). Sinyal BUY diurutkan `ml_confidence` tertinggi, top 10.
-pub async fn get_top_signals_live_service(
-    pool: &PgPool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<Vec<TopSignal>, AppError> {
-    let flex_params = find_flex_params_by_type(tx, SYMBOL_TYPE_PARAM, true).await?;
+/// Rekomendasi momentum (daftar pantauan coin, bukan sinyal bot) dari API strategi Python,
+/// diteruskan apa adanya — termasuk `id` & `image_url` tiap coin yang sudah disiapkan Python dari
+/// `flex_params`. Di-cache di Redis: isinya cuma berubah sekali sehari, jadi Python tidak perlu
+/// dipanggil tiap kali user membuka halaman.
+pub async fn get_recommendations_service(
+    redis: &RedisPool,
+    query: RecommendationQuery,
+) -> Result<Value, AppError> {
+    let limit = query.limit.unwrap_or(MAX_RECOMMENDATION_LIMIT);
+    if !(MIN_RECOMMENDATION_LIMIT..=MAX_RECOMMENDATION_LIMIT).contains(&limit) {
+        return Err(AppError::BadRequest(format!(
+            "limit harus {MIN_RECOMMENDATION_LIMIT}-{MAX_RECOMMENDATION_LIMIT}"
+        )));
+    }
 
-    let scored = join_all(
-        flex_params
-            .iter()
-            .map(|fp| score_symbol_live(pool, &fp.value_param)),
-    )
-    .await;
+    let date = query.date.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    if let Some(date) = date {
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|_| AppError::BadRequest("date harus format YYYY-MM-DD".to_string()))?;
+    }
 
-    let photo_by_symbol: HashMap<String, Option<String>> = flex_params
-        .into_iter()
-        .map(|fp| (fp.value_param, fp.photo_url))
-        .collect();
+    let key = recommendation_cache_key(limit, date);
+    if let Ok(mut conn) = redis.get().await {
+        if let Ok(Some(cached)) = conn.get::<_, Option<String>>(&key).await {
+            if let Ok(value) = serde_json::from_str::<Value>(&cached) {
+                return Ok(value);
+            }
+        }
+    }
 
-    let mut signals: Vec<ScoreLiveResponse> = scored
-        .into_iter()
-        .flatten()
-        .filter(|s| s.verdict == "BUY" && s.ml_confidence.is_some())
-        .collect();
+    let response = strategy_api::get_momentum_recommendations(limit, date).await?;
 
-    signals.sort_by(|a, b| {
-        b.ml_confidence
-            .unwrap_or(0.0)
-            .partial_cmp(&a.ml_confidence.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    signals.truncate(TOP_SIGNALS_COUNT);
+    // Cache best-effort: Redis bermasalah tidak boleh menggagalkan response.
+    let ttl = if date.is_some() {
+        RECOMMENDATION_PAST_DATE_CACHE_SECONDS
+    } else {
+        latest_recommendation_cache_seconds()
+    };
+    if let (Ok(mut conn), Ok(serialized)) = (redis.get().await, serde_json::to_string(&response)) {
+        let _: Result<(), _> = conn.set_ex(&key, serialized, ttl).await;
+    }
 
-    let top_signals = signals
-        .into_iter()
-        .map(|s| TopSignal {
-            photo_url: photo_by_symbol.get(&s.symbol).cloned().flatten(),
-            ml_confidence: s.ml_confidence.unwrap_or(0.0),
-            reason: s.reason,
-            close: s.close,
-            ma: s.ma,
-            momentum: s.momentum,
-            volume: s.volume,
-            relative_strength: s.relative_strength,
-            reversal: s.reversal,
-            regime: s.regime,
-            symbol: s.symbol,
-        })
-        .collect();
-
-    Ok(top_signals)
+    Ok(response)
 }

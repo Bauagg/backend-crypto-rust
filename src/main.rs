@@ -1,3 +1,4 @@
+mod clients;
 mod config;
 mod database;
 mod middlewares;
@@ -5,7 +6,7 @@ mod router;
 mod services;
 mod utils;
 
-use axum::{routing::get, Json, Router};
+use axum::{routing::get, Extension, Json, Router};
 use serde_json::json;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 
@@ -15,10 +16,12 @@ async fn main() {
     let _log_guard = config::logger::init();
 
     let pool = database::connect().await;
+    let redis_pool = database::connect_redis().await;
+    let kline_hub = services::market::stream_hub::KlineHub::new(redis_pool.clone());
 
-    tokio::spawn(startup_market_data(pool.clone()));
-    tokio::spawn(services::candle_market::collector::start(pool.clone()));
-    tokio::spawn(services::fear_greed::service::start_periodic_refresh(pool.clone()));
+    // Background worker: jalan terus selama server hidup, tidak menunda server siap menerima request.
+    tokio::spawn(start_market_workers(pool.clone()));
+    tokio::spawn(services::fear_greed::worker::start(pool.clone()));
 
     let upload_folder = std::env::var("PATH_FILE_UPLOAD").unwrap_or_else(|_| "files".to_string());
     let upload_folder = upload_folder.trim().to_string();
@@ -28,6 +31,8 @@ async fn main() {
         .nest_service(&format!("/{upload_folder}"), ServeDir::new(&upload_folder))
         .nest("/api", router::router())
         .with_state(pool)
+        .layer(Extension(redis_pool))
+        .layer(Extension(kline_hub))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -40,40 +45,10 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
-/// Sekali jalan saat startup (di background, tidak menunda server siap menerima request):
-/// isi histori `market_candles` untuk semua simbol aktif dari REST Tokocrypto (`backfill`),
-/// dan refresh cache Fear & Greed Index — keduanya dibutuhkan endpoint `/api/market/signals/live`.
-async fn startup_market_data(pool: sqlx::PgPool) {
-    if let Err(err) = services::fear_greed::service::refresh_fng_service(&pool).await {
-        tracing::error!("Gagal refresh cache Fear & Greed Index: {err:?}");
-    } else {
-        tracing::info!("Cache Fear & Greed Index berhasil di-refresh");
-    }
-
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(err) => {
-            tracing::error!("Gagal memulai transaksi untuk backfill: {err}");
-            return;
-        }
-    };
-
-    let flex_params = match services::flex_params::repository::find_flex_params_by_type(
-        &mut tx,
-        "SIMBOL_CRYPTO",
-        true,
-    )
-    .await
-    {
-        Ok(params) => params,
-        Err(err) => {
-            tracing::error!("Gagal mengambil daftar simbol untuk backfill: {err:?}");
-            return;
-        }
-    };
-    let _ = tx.commit().await;
-
-    let symbols: Vec<String> = flex_params.into_iter().map(|fp| fp.value_param).collect();
-    services::candle_market::backfill::backfill_symbols(&pool, &symbols).await;
-    tracing::info!("Backfill histori market_candles selesai untuk {} simbol", symbols.len());
+/// Daftar coin disinkronkan dulu sebelum worker candle jalan — supaya coin baru hasil sync
+/// langsung ikut dikumpulkan candle-nya di putaran pertama, bukan menunggu 30 menit.
+async fn start_market_workers(pool: sqlx::PgPool) {
+    services::coin_symbols::worker::sync_once(&pool).await;
+    tokio::spawn(services::candle_ohlcv::worker::start(pool.clone()));
+    services::coin_symbols::worker::start(pool).await;
 }

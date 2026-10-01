@@ -23,6 +23,10 @@ pub struct User {
     pub photo_url: Option<String>,
     /// Saldo akun demo (representasi USD), default 1000, bisa diubah lewat endpoint profile.
     pub demo_balance: Decimal,
+    /// Status aktif robot trading di akun demo (simulasi, pakai `demo_balance`).
+    pub is_robot_demo_active: bool,
+    /// Status aktif robot trading di akun real/platform (pakai `api_key`/`api_secret` exchange).
+    pub is_robot_platform_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

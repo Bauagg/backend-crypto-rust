@@ -7,7 +7,7 @@ use uuid::Uuid;
 /// dataset historis untuk analisis & training ML. Presisi harga pakai `Decimal`, bukan `f64`,
 /// supaya tidak ada pembulatan mengambang yang bisa merusak akurasi data harga/volume.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
-pub struct MarketCandle {
+pub struct CandleOhlcv {
     pub id: Uuid,
     pub symbol: String,
     pub interval: String,

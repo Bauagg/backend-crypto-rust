@@ -1,12 +1,17 @@
+use std::sync::Arc;
+
 use axum::{
     extract::{ws::WebSocketUpgrade, Query, State},
     response::Response,
+    Extension,
 };
 use sqlx::PgPool;
 
-use super::service::{get_klines_service, get_symbols_service, get_top_signals_live_service};
-use super::types::{is_valid_interval, KlinesQuery, SymbolsQuery, WsKlineQuery};
+use super::service::{get_klines_service, get_recommendations_service, get_symbols_service};
+use super::stream_hub::KlineHub;
+use super::types::{is_valid_interval, KlinesQuery, RecommendationQuery, SymbolsQuery, WsKlineQuery};
 use super::websocket::relay_kline_stream;
+use crate::database::RedisPool;
 use crate::utils::api_response::{paginated, success, PaginationParams};
 use crate::utils::app_error::AppError;
 
@@ -22,8 +27,11 @@ async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), AppE
         .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
 }
 
-pub async fn get_klines(Query(query): Query<KlinesQuery>) -> Result<Response, AppError> {
-    let result = get_klines_service(query).await?;
+pub async fn get_klines(
+    Extension(redis): Extension<RedisPool>,
+    Query(query): Query<KlinesQuery>,
+) -> Result<Response, AppError> {
+    let result = get_klines_service(&redis, query).await?;
     Ok(success(result, "Berhasil mengambil data chart"))
 }
 
@@ -36,6 +44,7 @@ pub async fn get_symbols(
     let mut tx = begin_tx(&pool).await?;
 
     let (symbols, total) = match get_symbols_service(
+        &pool,
         &mut tx,
         query.search.as_deref(),
         pagination.limit,
@@ -54,10 +63,22 @@ pub async fn get_symbols(
     Ok(paginated(symbols, total, &pagination, "Berhasil mengambil daftar pair"))
 }
 
-/// Upgrade koneksi HTTP jadi WebSocket, lalu relay kline stream Binance (candle live) ke client.
+/// Daftar pantauan coin dari API strategi Python (bukan sinyal bot, tidak dieksekusi otomatis).
+/// Contoh: GET /api/market/recommendations?limit=10
+pub async fn get_recommendations(
+    Extension(redis): Extension<RedisPool>,
+    Query(query): Query<RecommendationQuery>,
+) -> Result<Response, AppError> {
+    let result = get_recommendations_service(&redis, query).await?;
+    Ok(success(result, "Berhasil mengambil rekomendasi coin"))
+}
+
+/// Upgrade koneksi HTTP jadi WebSocket, lalu kirim candle live ke client lewat `KlineHub`
+/// (1 koneksi ke exchange per simbol+interval, dipakai bersama semua client).
 /// Contoh: GET /api/market/ws?symbol=BTCUSDT&interval=1m (upgrade header WebSocket).
 pub async fn ws_klines(
     ws: WebSocketUpgrade,
+    Extension(hub): Extension<Arc<KlineHub>>,
     Query(query): Query<WsKlineQuery>,
 ) -> Result<axum::response::Response, AppError> {
     if query.symbol.trim().is_empty() {
@@ -69,24 +90,7 @@ pub async fn ws_klines(
         return Err(AppError::BadRequest("interval tidak valid".to_string()));
     }
 
-    let symbol = query.symbol.trim().to_string();
+    let symbol = query.symbol.trim().to_uppercase();
 
-    Ok(ws.on_upgrade(move |socket| relay_kline_stream(socket, symbol, interval)))
-}
-
-/// 10 sinyal BUY terbaik dievaluasi untuk SEMUA simbol aktif di `flex_params` (bukan cuma
-/// coin yang model sudah dilatih), pakai data live `market_candles` kita sendiri via `/score-live`.
-pub async fn get_top_signals_live(State(pool): State<PgPool>) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match get_top_signals_live_service(&pool, &mut tx).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
-    Ok(success(result, "Berhasil mengevaluasi sinyal live untuk semua simbol aktif"))
+    Ok(ws.on_upgrade(move |socket| relay_kline_stream(socket, hub, symbol, interval)))
 }

@@ -40,6 +40,35 @@ fn validate_role(role: &str) -> Result<(), validator::ValidationError> {
     }
 }
 
+/// Daftar exchange yang didukung — dicek case-insensitive lewat `is_supported_platform`,
+/// tapi disimpan apa adanya sesuai input user (tidak dipaksa lowercase) supaya tampilan
+/// di FE tetap sesuai yang diketik user (mis. "Binance").
+pub const SUPPORTED_PLATFORMS: [&str; 1] = ["binance"];
+
+pub fn is_supported_platform(platform: &str) -> bool {
+    SUPPORTED_PLATFORMS.contains(&platform.to_lowercase().as_str())
+}
+
+fn validate_platform(platform: &str) -> Result<(), validator::ValidationError> {
+    if is_supported_platform(platform) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("unsupported_platform").with_message(
+            format!("Platform harus salah satu dari: {}", SUPPORTED_PLATFORMS.join(", ")).into(),
+        ))
+    }
+}
+
+/// API key/secret Binance selalu 64 karakter alfanumerik (huruf+angka, HMAC key standar mereka).
+fn validate_binance_credential(value: &str) -> Result<(), validator::ValidationError> {
+    if value.len() == 64 && value.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("invalid_binance_credential")
+            .with_message("Harus 64 karakter alfanumerik (format API key/secret Binance)".into()))
+    }
+}
+
 #[derive(Debug, Deserialize, Validate)]
 pub struct LoginInput {
     #[validate(email(message = "Format email tidak valid"))]
@@ -68,12 +97,22 @@ pub struct UpdateProfileInput {
     #[validate(length(min = 10, max = 15, message = "Nomor telepon harus 10-15 digit"))]
     pub phone: Option<String>,
 
+    #[validate(custom(function = "validate_platform"))]
     pub platform: Option<String>,
+
+    #[validate(custom(function = "validate_binance_credential"))]
     pub api_key: Option<String>,
+
+    #[validate(custom(function = "validate_binance_credential"))]
     pub api_secret: Option<String>,
 
     /// Saldo akun demo (representasi USD) — user boleh update nominalnya sendiri.
     /// Validasi tidak-boleh-negatif dicek manual di service (crate `validator` tidak
     /// mendukung `range` untuk tipe `Decimal`).
     pub demo_balance: Option<Decimal>,
+
+    /// Nyalakan/matikan robot trading di akun demo.
+    pub is_robot_demo_active: Option<bool>,
+    /// Nyalakan/matikan robot trading di akun real/platform.
+    pub is_robot_platform_active: Option<bool>,
 }

@@ -131,11 +131,25 @@ async fn parse_update_profile_multipart(
                 let value = field.text().await.unwrap_or_default();
                 input.demo_balance = Decimal::from_str(&value).ok();
             }
+            "is_robot_demo_active" => {
+                input.is_robot_demo_active = parse_bool_field(field.text().await.unwrap_or_default());
+            }
+            "is_robot_platform_active" => {
+                input.is_robot_platform_active = parse_bool_field(field.text().await.unwrap_or_default());
+            }
             _ => {}
         }
     }
 
     Ok((input, photo))
+}
+
+fn parse_bool_field(value: String) -> Option<bool> {
+    match value.as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn non_empty(value: String) -> Option<String> {

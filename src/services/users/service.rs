@@ -8,7 +8,8 @@ use super::model::User;
 use super::repository::{
     create_user, find_user_by_email, find_user_by_id, find_user_by_phone, update_user,
 };
-use super::types::{LoginInput, RegisterInput, UpdateProfileInput};
+use super::types::{is_supported_platform, LoginInput, RegisterInput, UpdateProfileInput};
+use crate::clients::binance;
 use crate::services::documents::service::{update_file_service, upload_file_service, UploadInput};
 use crate::services::documents::types::FileMetaInput;
 use crate::utils::app_error::AppError;
@@ -37,6 +38,8 @@ pub struct UserProfile {
     pub photo_id: Option<String>,
     pub photo_url: Option<String>,
     pub demo_balance: Decimal,
+    pub is_robot_demo_active: bool,
+    pub is_robot_platform_active: bool,
 }
 
 impl From<User> for UserProfile {
@@ -53,6 +56,8 @@ impl From<User> for UserProfile {
             photo_id: user.photo_id,
             photo_url: user.photo_url,
             demo_balance: user.demo_balance,
+            is_robot_demo_active: user.is_robot_demo_active,
+            is_robot_platform_active: user.is_robot_platform_active,
         }
     }
 }
@@ -152,9 +157,9 @@ pub async fn update_profile_service(
     input.validate()?;
 
     if let Some(balance) = input.demo_balance {
-        if balance.is_sign_negative() {
+        if balance < Decimal::from(1) || balance > Decimal::from(100000) {
             return Err(AppError::BadRequest(
-                "Saldo demo tidak boleh negatif".to_string(),
+                "Saldo demo harus antara 1 dan 100000".to_string(),
             ));
         }
     }
@@ -167,13 +172,51 @@ pub async fn update_profile_service(
     let email = input.email.unwrap_or(existing.email);
     let phone = input.phone.unwrap_or(existing.phone);
 
-    let platform = input.platform.or(existing.platform);
-    let api_key = input.api_key.or(existing.api_key);
+    let platform = input.platform.clone().or(existing.platform.clone());
+    let api_key = input.api_key.clone().or(existing.api_key.clone());
+
+    // Kredensial exchange baru wajib diverifikasi valid ke Binance dulu sebelum disimpan --
+    // hanya dijalankan kalau user memang mengirim api_key/api_secret baru di request ini
+    // (bukan setiap update profil biasa), dan cuma untuk platform yang memang didukung.
+    if input.api_key.is_some() || input.api_secret.is_some() {
+        let platform_name = platform
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("platform wajib diisi untuk verifikasi kredensial".to_string()))?;
+        let key = api_key
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("api_key wajib diisi".to_string()))?;
+        let secret = input
+            .api_secret
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("api_secret wajib diisi".to_string()))?;
+
+        if !is_supported_platform(platform_name) {
+            return Err(AppError::BadRequest(format!(
+                "Platform '{platform_name}' belum didukung untuk verifikasi kredensial"
+            )));
+        }
+        binance::verify_credentials(key, secret).await?;
+    }
+
     let api_secret = match input.api_secret {
         Some(new_secret) => Some(encrypt(&new_secret)?),
         None => existing.api_secret,
     };
     let demo_balance = input.demo_balance.unwrap_or(existing.demo_balance);
+    let is_robot_demo_active = input.is_robot_demo_active.unwrap_or(existing.is_robot_demo_active);
+    let is_robot_platform_active = input
+        .is_robot_platform_active
+        .unwrap_or(existing.is_robot_platform_active);
+
+    // Robot platform (akun real) cuma boleh aktif kalau ada kredensial exchange lengkap --
+    // platform + api_key + api_secret. Kalau request ini kirim api_key/api_secret baru, itu
+    // sudah diverifikasi ke Binance di atas; kalau tidak, berarti mengandalkan kredensial lama
+    // yang tersimpan (sudah pernah diverifikasi saat pertama kali disimpan).
+    if is_robot_platform_active && (platform.is_none() || api_key.is_none() || api_secret.is_none()) {
+        return Err(AppError::BadRequest(
+            "Robot platform tidak bisa diaktifkan tanpa platform, api_key, dan api_secret yang valid".to_string(),
+        ));
+    }
 
     let (photo_id, photo_url) = match photo {
         Some(photo) => {
@@ -219,6 +262,8 @@ pub async fn update_profile_service(
         photo_id.as_deref(),
         photo_url.as_deref(),
         demo_balance,
+        is_robot_demo_active,
+        is_robot_platform_active,
     )
     .await?;
 

@@ -11,8 +11,8 @@ use crate::utils::app_error::AppError;
 
 const STORED_INTERVAL: &str = "1d";
 
-/// Baca data historis dari `market_candles` (dikumpulkan sendiri oleh background collector +
-/// backfill, bukan proxy live ke Tokocrypto) — cocok untuk export dataset ML, dan sebagai
+/// Baca data historis dari `candle_ohlcv` (dikumpulkan sendiri oleh background worker,
+/// bukan proxy live ke exchange) — cocok untuk export dataset ML, dan sebagai
 /// fallback chart harian kalau proxy live (`/api/market/klines`) sedang tidak bisa diakses.
 /// Hanya menyediakan interval 1d karena itu satu-satunya yang dikumpulkan.
 pub async fn get_stored_candles(

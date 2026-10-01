@@ -77,13 +77,16 @@ pub async fn update_user(
     photo_id: Option<&str>,
     photo_url: Option<&str>,
     demo_balance: Decimal,
+    is_robot_demo_active: bool,
+    is_robot_platform_active: bool,
 ) -> Result<User, AppError> {
     let user = sqlx::query_as::<_, User>(
         r#"
         UPDATE users
         SET full_name = $1, email = $2, phone = $3, platform = $4, api_key = $5,
-            api_secret = $6, photo_id = $7, photo_url = $8, demo_balance = $9, updated_at = now()
-        WHERE id = $10 AND deleted_at IS NULL
+            api_secret = $6, photo_id = $7, photo_url = $8, demo_balance = $9,
+            is_robot_demo_active = $10, is_robot_platform_active = $11, updated_at = now()
+        WHERE id = $12 AND deleted_at IS NULL
         RETURNING *
         "#,
     )
@@ -96,6 +99,8 @@ pub async fn update_user(
     .bind(photo_id)
     .bind(photo_url)
     .bind(demo_balance)
+    .bind(is_robot_demo_active)
+    .bind(is_robot_platform_active)
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?

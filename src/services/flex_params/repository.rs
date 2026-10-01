@@ -118,6 +118,73 @@ pub async fn find_flex_params_by_type(
     Ok(params)
 }
 
+/// Baris yang sudah di-soft-delete untuk 1 tipe, sebagai `(id, value_param, deleted_by, punya_foto)`
+/// — terbaru dulu per `value_param`. Dipakai sync otomatis (mis. `coin_symbols`) untuk membedakan
+/// baris yang dihapus sistem (boleh dipulihkan) dari yang dihapus user (tidak boleh dibuat ulang).
+pub async fn find_deleted_flex_params_by_type(
+    tx: &mut Transaction<'_, Postgres>,
+    type_param: &str,
+) -> Result<Vec<(Uuid, String, Option<String>, bool)>, AppError> {
+    let rows = sqlx::query_as(
+        r#"
+        SELECT id, value_param, deleted_by, photo_url IS NOT NULL FROM flex_params
+        WHERE type_param = $1 AND deleted_at IS NOT NULL
+        ORDER BY value_param ASC, deleted_at DESC
+        "#,
+    )
+    .bind(type_param)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+/// `value_param` 1 tipe yang masih hidup **plus** yang di-soft-delete dalam `deleted_within_days`
+/// hari terakhir, sebagai `(value_param, sudah_dihapus)`. Dipakai worker candle supaya data coin
+/// yang baru keluar dari daftar tetap terkumpul sebentar (mis. untuk evaluasi rekomendasi lama).
+pub async fn find_flex_param_values_with_recently_deleted(
+    tx: &mut Transaction<'_, Postgres>,
+    type_param: &str,
+    deleted_within_days: i32,
+) -> Result<Vec<(String, bool)>, AppError> {
+    let rows = sqlx::query_as(
+        r#"
+        SELECT value_param, bool_and(deleted_at IS NOT NULL) AS is_deleted
+        FROM flex_params
+        WHERE type_param = $1
+          AND (deleted_at IS NULL OR deleted_at > now() - make_interval(days => $2))
+        GROUP BY value_param
+        ORDER BY value_param ASC
+        "#,
+    )
+    .bind(type_param)
+    .bind(deleted_within_days)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+/// Batalkan soft delete (`deleted_at`/`deleted_by` dikosongkan) — foto & data lain tetap utuh.
+pub async fn restore_flex_param(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    is_active: bool,
+    updated_by: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE flex_params
+        SET deleted_at = NULL, deleted_by = NULL, is_active = $1, updated_by = $2, updated_at = now()
+        WHERE id = $3 AND deleted_at IS NOT NULL
+        "#,
+    )
+    .bind(is_active)
+    .bind(updated_by)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn find_flex_params_by_header_id(
     tx: &mut Transaction<'_, Postgres>,
     header_id: Uuid,
