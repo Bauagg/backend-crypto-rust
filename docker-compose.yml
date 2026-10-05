@@ -1,11 +1,18 @@
-# Backend Rust + Postgres + Redis (+ Dozzle opsional untuk melihat log di browser).
+# Backend Rust (+ Postgres & Redis opsional, + Dozzle opsional untuk melihat log di browser).
 #
-#   cp .env.docker.example .env.docker   # isi password & secret
-#   docker compose up -d --build         # jalankan
-#   docker compose --profile tools up -d # + Dozzle (log viewer) di http://127.0.0.1:8888
+#   cp .env.docker.example .env.docker      # isi password & secret
 #
-# Semua konfigurasi aplikasi di `.env.docker` (bukan `.env` — itu untuk jalan lokal tanpa Docker,
-# host DB/Redis-nya `localhost`; di Docker host-nya nama service: `postgres`, `redis`).
+# VPS (Postgres & Redis SUDAH ADA di server, port-nya dibuka di host):
+#   docker compose up -d                    # hanya backend
+#   .env.docker: host DB/Redis = host.docker.internal
+#
+# Laptop / server kosong (Postgres & Redis ikut dijalankan compose):
+#   docker compose --profile local-db up -d --build
+#   .env.docker: host DB/Redis = postgres / redis
+#
+#   docker compose --profile tools up -d    # + Dozzle (log viewer) di http://127.0.0.1:8888
+#
+# Semua konfigurasi aplikasi di `.env.docker` (bukan `.env` — itu untuk jalan lokal tanpa Docker).
 
 # Batas log per container: maks 3 file × 10 MB, yang lama otomatis terhapus — disk tidak penuh.
 x-logging: &default-logging
@@ -23,11 +30,18 @@ services:
     container_name: treding-backend
     restart: unless-stopped
     env_file: .env.docker
+    # Postgres/Redis dari compose hanya ditunggu kalau profile `local-db` dinyalakan; di VPS
+    # (memakai Postgres/Redis yang sudah ada di host) dilewati.
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
       redis:
         condition: service_healthy
+        required: false
+    # `host.docker.internal` = mesin host (VPS) — untuk Postgres/Redis yang jalan di luar compose ini.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Hanya bisa diakses dari VPS itu sendiri (Cloudflare Tunnel / Nginx di host meneruskan ke
     # sini). Port 8000 tidak terbuka ke internet.
     ports:
@@ -43,6 +57,7 @@ services:
     networks: [treding]
 
   postgres:
+    profiles: [local-db]
     image: postgres:17-alpine
     container_name: treding-postgres
     restart: unless-stopped
@@ -64,6 +79,7 @@ services:
   # Redis hanya cache (chart/klines, rekomendasi) — tidak perlu disimpan ke disk. Kalau memori
   # penuh, data paling jarang dipakai dibuang otomatis.
   redis:
+    profiles: [local-db]
     image: redis:7-alpine
     container_name: treding-redis
     restart: unless-stopped

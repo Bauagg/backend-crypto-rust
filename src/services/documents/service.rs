@@ -11,8 +11,13 @@ fn upload_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(folder.trim())
 }
 
+/// `/` di akhir dibuang supaya URL file tidak jadi `https://domain//files/...`.
 fn base_url() -> String {
-    std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string())
+    std::env::var("BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// Simpan bytes file ke disk dengan nama unik (UUID + extension asli), lalu kembalikan URL publiknya.
