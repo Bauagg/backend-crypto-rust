@@ -197,13 +197,12 @@ async fn get_history_klines(
 
     // Banyak user minta rentang yang sama bersamaan -> cuma 1 yang ke exchange, sisanya menunggu.
     let locked = repository::try_lock(redis, symbol, interval, end_time, limit).await;
-    if !locked {
-        if let Some(candles) =
+    if !locked
+        && let Some(candles) =
             repository::wait_for_range(redis, symbol, interval, end_time, limit).await
         {
             return Ok(candles);
         }
-    }
 
     let result = fetch_klines(symbol, interval, limit, Some(end_time)).await;
     if let Ok(candles) = &result {
@@ -225,32 +224,28 @@ async fn get_latest_klines(
 ) -> Result<Vec<Candle>, AppError> {
     // Ada client yang sedang membuka chart ini -> stream hub menjaga candle live & histori di
     // Redis tetap terbaru, jadi tidak perlu ke exchange sama sekali.
-    if end_time.is_none() {
-        if let Some(candles) = repository::read_latest(redis, symbol, interval, limit).await {
+    if end_time.is_none()
+        && let Some(candles) = repository::read_latest(redis, symbol, interval, limit).await {
             return Ok(candles);
         }
-    }
 
     let cache_key = klines_cache_key(symbol, interval, limit, end_time);
 
-    if let Ok(mut conn) = redis.get().await {
-        if let Ok(Some(cached)) = conn.get::<_, Option<String>>(&cache_key).await {
-            if let Ok(candles) = serde_json::from_str::<Vec<Candle>>(&cached) {
+    if let Ok(mut conn) = redis.get().await
+        && let Ok(Some(cached)) = conn.get::<_, Option<String>>(&cache_key).await
+            && let Ok(candles) = serde_json::from_str::<Vec<Candle>>(&cached) {
                 return Ok(candles);
             }
-        }
-    }
 
     let candles = fetch_klines(symbol, interval, limit, end_time).await?;
 
     // Cache best-effort: gagal simpan (Redis down, dll) tidak boleh menggagalkan response.
-    if let Ok(mut conn) = redis.get().await {
-        if let Ok(serialized) = serde_json::to_string(&candles) {
+    if let Ok(mut conn) = redis.get().await
+        && let Ok(serialized) = serde_json::to_string(&candles) {
             let _: Result<(), _> = conn
                 .set_ex(&cache_key, serialized, KLINES_CACHE_TTL_SECONDS)
                 .await;
         }
-    }
     let reached_listing_start = candles.len() < limit as usize;
     repository::store_closed(redis, symbol, interval, &candles, reached_listing_start).await;
 
@@ -307,13 +302,11 @@ pub async fn get_recommendations_service(
     }
 
     let key = recommendation_cache_key(limit, date);
-    if let Ok(mut conn) = redis.get().await {
-        if let Ok(Some(cached)) = conn.get::<_, Option<String>>(&key).await {
-            if let Ok(value) = serde_json::from_str::<Value>(&cached) {
+    if let Ok(mut conn) = redis.get().await
+        && let Ok(Some(cached)) = conn.get::<_, Option<String>>(&key).await
+            && let Ok(value) = serde_json::from_str::<Value>(&cached) {
                 return Ok(value);
             }
-        }
-    }
 
     let response = strategy_api::get_momentum_recommendations(limit, date).await?;
 
