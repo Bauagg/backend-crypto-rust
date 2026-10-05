@@ -112,6 +112,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cek secret sebelum dipakai — pesan jelas kalau kosong/salah format, plus fingerprint key
+      # (aman ditampilkan) untuk dicocokkan dengan `ssh-keygen -lf ~/.ssh/github_deploy` di VPS.
+      - name: Cek secret SSH
+        env:
+          SSH_KEY: ${{ secrets.DEV_VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.DEV_VPS_HOST }}
+          VPS_USER: ${{ secrets.DEV_VPS_USER }}
+          APP_DIR: ${{ secrets.DEV_VPS_APP_DIR }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "$VPS_HOST" ] || fail "Secret DEV_VPS_HOST kosong / tidak ditemukan"
+          [ -n "$VPS_USER" ] || fail "Secret DEV_VPS_USER kosong / tidak ditemukan"
+          [ -n "$APP_DIR" ]  || fail "Secret DEV_VPS_APP_DIR kosong / tidak ditemukan"
+          [ -n "$SSH_KEY" ]  || fail "Secret DEV_VPS_SSH_KEY kosong / tidak ditemukan (cek nama & tab Secrets -> Repository secrets)"
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > "$RUNNER_TEMP/deploy_key"
+          chmod 600 "$RUNNER_TEMP/deploy_key"
+          head -1 "$RUNNER_TEMP/deploy_key" | grep -q -- "-----BEGIN" \
+            || fail "DEV_VPS_SSH_KEY tidak diawali baris -----BEGIN OPENSSH PRIVATE KEY-----"
+          grep -q -- "-----END" "$RUNNER_TEMP/deploy_key" \
+            || fail "DEV_VPS_SSH_KEY tidak diakhiri baris -----END OPENSSH PRIVATE KEY-----"
+          ssh-keygen -lf "$RUNNER_TEMP/deploy_key" \
+            || fail "DEV_VPS_SSH_KEY bukan private key yang valid (mungkin yang disalin file .pub?)"
+          rm -f "$RUNNER_TEMP/deploy_key"
+          echo "Secret OK — cocokkan fingerprint di atas dengan: ssh-keygen -lf ~/.ssh/github_deploy"
+
       # docker-compose.yml selalu ikut versi terbaru di repo; .env.docker tetap di VPS (tidak
       # pernah disimpan di GitHub).
       - name: Kirim docker-compose.yml ke VPS
