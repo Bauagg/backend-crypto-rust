@@ -20,8 +20,8 @@ pub struct CreateTradePositionInput {
     pub account_mode: String,
 }
 
-/// Query param list posisi: search simbol + filter & sort dinamis (format sama dengan flex_params)
-/// + pagination. Contoh:
+/// Query param list posisi: search simbol, filter & sort dinamis (format sama dengan flex_params),
+/// dan pagination. Contoh:
 /// `?search=btc&filter=[{"key":"status","operator":"equal","value":"OPEN"}]&sort=opened_at&order=desc&page=1&limit=20`
 #[derive(Debug, Default, Deserialize)]
 pub struct TradePositionListQuery {

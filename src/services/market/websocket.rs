@@ -81,11 +81,10 @@ pub async fn relay_ticker_stream(client_socket: WebSocket, hub: Arc<TickerHub>, 
     let to_message = |items: &[MarketTicker]| serde_json::to_string(items).ok().map(Message::Text);
 
     let first = snapshot(&watched);
-    if let Some(msg) = (!first.is_empty()).then(|| to_message(&first)).flatten() {
-        if client_write.send(msg).await.is_err() {
+    if let Some(msg) = (!first.is_empty()).then(|| to_message(&first)).flatten()
+        && client_write.send(msg).await.is_err() {
             return;
         }
-    }
 
     loop {
         let outgoing = tokio::select! {

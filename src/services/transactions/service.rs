@@ -500,7 +500,7 @@ pub fn build_dashboard(
             a
         })
         .collect();
-    per_asset.sort_by(|a, b| b.realized_pnl.cmp(&a.realized_pnl));
+    per_asset.sort_by_key(|a| std::cmp::Reverse(a.realized_pnl));
 
     // Isi portofolio sekarang.
     let allocation_total = open_value + cash.unwrap_or_default();
@@ -514,7 +514,7 @@ pub fn build_dashboard(
             percent: ratio_percent(a.open_value, allocation_total),
         })
         .collect();
-    allocation.sort_by(|a, b| b.value.cmp(&a.value));
+    allocation.sort_by_key(|a| std::cmp::Reverse(a.value));
     if let Some(cash) = cash.filter(|c| !c.is_zero()) {
         allocation.push(AllocationItem {
             symbol: QUOTE_ASSET.to_string(),
@@ -564,11 +564,10 @@ async fn current_prices(ticker_hub: &TickerHub, symbols: Vec<String>) -> HashMap
         .filter_map(|(symbol, t)| Some((symbol, t.last_price.parse().ok()?)))
         .collect();
     let missing: Vec<String> = symbols.into_iter().filter(|s| !prices.contains_key(s)).collect();
-    if !missing.is_empty() {
-        if let Ok(tickers) = binance::get_tickers_24hr_for(&missing).await {
+    if !missing.is_empty()
+        && let Ok(tickers) = binance::get_tickers_24hr_for(&missing).await {
             prices.extend(tickers.into_iter().filter_map(|t| Some((t.symbol, t.last_price.parse().ok()?))));
         }
-    }
     prices
 }
 
@@ -589,11 +588,10 @@ pub async fn get_dashboard_service(
     if source.as_deref().is_some_and(|s| !SOURCES.contains(&s)) {
         return Err(AppError::BadRequest("source harus BOT atau MANUAL".to_string()));
     }
-    if let (Some(from), Some(to)) = (query.date_from, query.date_to) {
-        if from > to {
+    if let (Some(from), Some(to)) = (query.date_from, query.date_to)
+        && from > to {
             return Err(AppError::BadRequest("date_from tidak boleh setelah date_to".to_string()));
         }
-    }
 
     let (user, positions) = {
         let mut tx = begin(pool).await?;

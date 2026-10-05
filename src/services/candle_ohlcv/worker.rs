@@ -49,7 +49,7 @@ fn last_closed_open_time(now_ms: i64) -> i64 {
 
 /// Jalan sebagai background task selama server hidup: sync langsung saat start, lalu tiap slot
 /// 30 menit. Tiap putaran, daftar simbol dibaca ulang dari `flex_params` (SIMBOL_CRYPTO yang hidup
-/// + yang di-soft-delete < `KEEP_DELETED_DAYS` hari) — simbol baru otomatis ikut tanpa restart.
+/// dan yang di-soft-delete < `KEEP_DELETED_DAYS` hari) — simbol baru otomatis ikut tanpa restart.
 /// Simbol yang candle-nya sudah lengkap dilewati tanpa request ke exchange; sisanya di-fetch
 /// paralel: yang belum punya data diisi histori awal, yang tertinggal dikejar dari candle
 /// terakhirnya (sekaligus menambal data yang bolong).

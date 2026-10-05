@@ -238,13 +238,12 @@ pub async fn update_profile_service(
 ) -> Result<UserProfile, AppError> {
     input.validate()?;
 
-    if let Some(balance) = input.demo_balance {
-        if balance < Decimal::from(1) || balance > Decimal::from(100000) {
+    if let Some(balance) = input.demo_balance
+        && (balance < Decimal::from(1) || balance > Decimal::from(100000)) {
             return Err(AppError::BadRequest(
                 "Saldo demo harus antara 1 dan 100000".to_string(),
             ));
         }
-    }
 
     let existing = {
         let mut tx = begin(pool).await?;
