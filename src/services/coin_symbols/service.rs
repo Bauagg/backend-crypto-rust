@@ -281,8 +281,8 @@ pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, App
             None => logos.remove(symbol),
         };
         let has_photo = param.photo_url.is_some() || photo.is_some();
-        let new_category = Some(category_of(symbol))
-            .filter(|_| !LOCKED_SYMBOLS.contains(&symbol))
+        let new_category = (!LOCKED_SYMBOLS.contains(&symbol))
+            .then(|| category_of(symbol))
             .filter(|category| param.description.as_deref() != Some(*category));
 
         if param.is_active == has_photo && new_category.is_none() && photo.is_none() {

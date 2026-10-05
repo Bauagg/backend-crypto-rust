@@ -504,7 +504,7 @@ fn order_error(symbol: &str, err: ErrorResponse) -> AppError {
 }
 
 /// Kirim order MARKET ke exchange akun (`ACCOUNT_API_BASE_URL`). Balik hasil yang sudah di-parse
-/// + respons asli apa adanya (disimpan sebagai bukti order di `trade_positions`).
+/// dan respons asli apa adanya (disimpan sebagai bukti order di `trade_positions`).
 /// Order yang tidak tereksekusi sama sekali (`executedQty` 0, mis. `EXPIRED`) dianggap gagal.
 pub async fn place_market_order(
     api_key: &str,
