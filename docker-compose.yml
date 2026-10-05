@@ -2,17 +2,21 @@
 #
 #   cp .env.docker.example .env.docker      # isi password & secret
 #
-# VPS (Postgres & Redis SUDAH ADA di server, port-nya dibuka di host):
+# VPS (Postgres & Redis SUDAH ADA sebagai container lain, tersambung ke network `data-net`):
 #   docker compose up -d                    # hanya backend
-#   .env.docker: host DB/Redis = host.docker.internal
+#   .env.docker: host DB/Redis = nama container-nya (mis. `postgres`, `redis`)
 #
 # Laptop / server kosong (Postgres & Redis ikut dijalankan compose):
+#   docker network create proxy-net && docker network create data-net   # sekali saja
 #   docker compose --profile local-db up -d --build
-#   .env.docker: host DB/Redis = postgres / redis
 #
 #   docker compose --profile tools up -d    # + Dozzle (log viewer) di http://127.0.0.1:8888
 #
-# Semua konfigurasi aplikasi di `.env.docker` (bukan `.env` — itu untuk jalan lokal tanpa Docker).
+# Dev & prod bisa jalan berdampingan di 1 VPS (folder berbeda). Pembedanya di file `.env` (bukan
+# `.env.docker`) di folder yang sama — ditulis otomatis oleh CI/CD saat deploy:
+#   IMAGE_TAG        tag image GHCR yang dijalankan (dev: sha-xxxxxxx, prod: v1.2.3)
+#   CONTAINER_PREFIX awalan nama container (dev: treding, prod: treding-prod)
+#   BACKEND_PORT     port di 127.0.0.1 VPS (dev: 8000, prod: 8001)
 
 # Batas log per container: maks 3 file × 10 MB, yang lama otomatis terhapus — disk tidak penuh.
 x-logging: &default-logging
@@ -24,14 +28,14 @@ x-logging: &default-logging
 services:
   backend:
     # Lokal: `docker compose up -d --build` membangun dari Dockerfile.
-    # VPS: CI/CD menarik image jadi dari GHCR (`IMAGE_TAG` = dev / sha commit) tanpa build.
+    # VPS: CI/CD menarik image jadi dari GHCR tanpa build.
     build: .
     image: ghcr.io/bauagg/backend-crypto-rust:${IMAGE_TAG:-dev}
-    container_name: treding-backend
+    container_name: ${CONTAINER_PREFIX:-treding}-backend
     restart: unless-stopped
     env_file: .env.docker
     # Postgres/Redis dari compose hanya ditunggu kalau profile `local-db` dinyalakan; di VPS
-    # (memakai Postgres/Redis yang sudah ada di host) dilewati.
+    # (memakai Postgres/Redis yang sudah ada) dilewati.
     depends_on:
       postgres:
         condition: service_healthy
@@ -39,13 +43,13 @@ services:
       redis:
         condition: service_healthy
         required: false
-    # `host.docker.internal` = mesin host (VPS) — untuk Postgres/Redis yang jalan di luar compose ini.
+    # `host.docker.internal` = mesin host (VPS) — untuk service yang port-nya dibuka di host.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Hanya bisa diakses dari VPS itu sendiri (Cloudflare Tunnel / Nginx di host meneruskan ke
-    # sini). Port 8000 tidak terbuka ke internet.
+    # Hanya bisa diakses dari VPS itu sendiri (Nginx Proxy Manager / Cloudflare Tunnel yang
+    # meneruskan ke sini). Port tidak terbuka ke internet.
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     volumes:
       # Foto/logo upload — harus tetap ada walau container dibuat ulang.
       - uploads:/app/files
@@ -54,12 +58,13 @@ services:
         limits:
           memory: 256m
     logging: *default-logging
-    networks: [treding]
+    # proxy-net: dijangkau Nginx Proxy Manager. data-net: menjangkau Postgres, Redis, API Python.
+    networks: [proxy-net, data-net]
 
   postgres:
     profiles: [local-db]
     image: postgres:17-alpine
-    container_name: treding-postgres
+    container_name: ${CONTAINER_PREFIX:-treding}-postgres
     restart: unless-stopped
     env_file: .env.docker
     volumes:
@@ -74,14 +79,14 @@ services:
         limits:
           memory: 512m
     logging: *default-logging
-    networks: [treding]
+    networks: [data-net]
 
   # Redis hanya cache (chart/klines, rekomendasi) — tidak perlu disimpan ke disk. Kalau memori
   # penuh, data paling jarang dipakai dibuang otomatis.
   redis:
     profiles: [local-db]
     image: redis:7-alpine
-    container_name: treding-redis
+    container_name: ${CONTAINER_PREFIX:-treding}-redis
     restart: unless-stopped
     env_file: .env.docker
     command: >
@@ -97,13 +102,14 @@ services:
         limits:
           memory: 160m
     logging: *default-logging
-    networks: [treding]
+    networks: [data-net]
 
   # Log viewer di browser (opsional): `docker compose --profile tools up -d`. Dibuka lewat
   # http://127.0.0.1:8888 di VPS (atau SSH tunnel: ssh -L 8888:127.0.0.1:8888 user@vps).
+  # Cukup dinyalakan di salah satu environment — Dozzle menampilkan log semua container.
   dozzle:
     image: amir20/dozzle:latest
-    container_name: treding-dozzle
+    container_name: ${CONTAINER_PREFIX:-treding}-dozzle
     restart: unless-stopped
     profiles: [tools]
     volumes:
@@ -120,9 +126,16 @@ volumes:
   pgdata:
   uploads:
 
-# Nama network tetap supaya container API Python (repo backtes-crypto) bisa ikut bergabung:
-#   networks: { treding: { external: true, name: treding-net } }
-# lalu di `.env.docker`: STRATEGY_API_BASE_URL=http://<nama-service-python>:8080
+# Dua network terpisah supaya yang menghadap internet tidak bisa menyentuh database:
+#   proxy-net : Nginx Proxy Manager + container web/API tiap aplikasi
+#   data-net  : Postgres + Redis + container aplikasi yang butuh database (backend, API Python)
+# Backend masuk keduanya; Nginx hanya proxy-net; Postgres/Redis hanya data-net.
+# External supaya dipakai bersama dev, prod & aplikasi lain — dibuat sekali (CI/CD membuatnya
+# otomatis):  docker network create proxy-net && docker network create data-net
 networks:
-  treding:
-    name: treding-net
+  proxy-net:
+    name: proxy-net
+    external: true
+  data-net:
+    name: data-net
+    external: true

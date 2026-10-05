@@ -166,8 +166,11 @@ jobs:
             set -e
             cd "$APP_DIR"
             test -f .env.docker || { echo ".env.docker belum ada di $APP_DIR"; exit 1; }
+            # Variabel compose environment dev (dibaca otomatis oleh `docker compose` di folder ini,
+            # termasuk saat dijalankan manual) — container treding-backend, port 127.0.0.1:8000.
+            printf 'IMAGE_TAG=%s\nCONTAINER_PREFIX=treding\nBACKEND_PORT=8000\n' "$IMAGE_TAG" > .env
+            for net in proxy-net data-net; do docker network inspect "$net" >/dev/null 2>&1 || docker network create "$net"; done
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            export IMAGE_TAG
             docker compose pull backend
             docker compose up -d --no-build --remove-orphans
             docker logout ghcr.io
