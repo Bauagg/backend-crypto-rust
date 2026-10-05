@@ -16,8 +16,10 @@ x-logging: &default-logging
 
 services:
   backend:
+    # Lokal: `docker compose up -d --build` membangun dari Dockerfile.
+    # VPS: CI/CD menarik image jadi dari GHCR (`IMAGE_TAG` = dev / sha commit) tanpa build.
     build: .
-    image: backend-treding-rust:latest
+    image: ghcr.io/bauagg/backend-crypto-rust:${IMAGE_TAG:-dev}
     container_name: treding-backend
     restart: unless-stopped
     env_file: .env.docker

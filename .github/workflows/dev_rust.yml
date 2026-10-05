@@ -1,0 +1,152 @@
+# CI/CD environment DEV (branch `main`).
+#
+#   Pull request ke main  -> CI saja: build + test (+ clippy) + cek Dockerfile bisa di-build.
+#                            Tidak ada yang di-push/deploy — PR gagal = jangan di-merge.
+#   Push / merge ke main   -> CI, lalu build image & push ke GHCR (ghcr.io), lalu deploy ke VPS
+#                            dev lewat SSH (docker compose pull + up).
+#
+# Secrets yang wajib diisi (Settings -> Secrets and variables -> Actions -> New repository secret):
+#   DEV_VPS_HOST      IP / hostname VPS dev
+#   DEV_VPS_USER      user SSH di VPS (mis. root / deploy)
+#   DEV_VPS_SSH_KEY   private key SSH (isi file id_ed25519, termasuk baris BEGIN/END)
+#   DEV_VPS_PORT      port SSH (opsional, default 22)
+#   DEV_VPS_APP_DIR   folder aplikasi di VPS, berisi .env.docker (mis. /opt/backend-crypto-rust)
+# Push ke GHCR memakai GITHUB_TOKEN bawaan — tidak perlu secret tambahan.
+
+name: Dev - Rust CI/CD
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# Push beruntun ke main -> run lama dibatalkan, hanya yang terbaru yang dideploy.
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: ghcr.io/bauagg/backend-crypto-rust
+
+jobs:
+  # -------------------------------------------------------------------------------------------
+  # 1. CI: kode harus bisa di-build & semua test lolos.
+  # -------------------------------------------------------------------------------------------
+  check:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      # Saran gaya ditampilkan di log, tidak menggagalkan build.
+      - name: Clippy (informasi)
+        run: cargo clippy --locked --all-targets
+
+  # -------------------------------------------------------------------------------------------
+  # 2. Build image Docker. PR: hanya dicek bisa di-build. Push ke main: di-push ke GHCR.
+  # -------------------------------------------------------------------------------------------
+  image:
+    name: Docker image
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag image
+        id: meta
+        run: echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:dev
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # -------------------------------------------------------------------------------------------
+  # 3. Deploy ke VPS dev (hanya push/merge ke main, bukan PR).
+  # -------------------------------------------------------------------------------------------
+  deploy:
+    name: Deploy dev
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker-compose.yml selalu ikut versi terbaru di repo; .env.docker tetap di VPS (tidak
+      # pernah disimpan di GitHub).
+      - name: Kirim docker-compose.yml ke VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_VPS_HOST }}
+          username: ${{ secrets.DEV_VPS_USER }}
+          key: ${{ secrets.DEV_VPS_SSH_KEY }}
+          port: ${{ secrets.DEV_VPS_PORT || 22 }}
+          source: docker-compose.yml
+          target: ${{ secrets.DEV_VPS_APP_DIR }}
+
+      - name: Pull image & restart backend
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_TAG: ${{ needs.image.outputs.tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_DIR: ${{ secrets.DEV_VPS_APP_DIR }}
+        with:
+          host: ${{ secrets.DEV_VPS_HOST }}
+          username: ${{ secrets.DEV_VPS_USER }}
+          key: ${{ secrets.DEV_VPS_SSH_KEY }}
+          port: ${{ secrets.DEV_VPS_PORT || 22 }}
+          envs: IMAGE_TAG,GHCR_USER,GHCR_TOKEN,APP_DIR
+          script: |
+            set -e
+            cd "$APP_DIR"
+            test -f .env.docker || { echo ".env.docker belum ada di $APP_DIR"; exit 1; }
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            export IMAGE_TAG
+            docker compose pull backend
+            docker compose up -d --no-build --remove-orphans
+            docker logout ghcr.io
+            docker image prune -f
+            sleep 5
+            docker compose ps
+            docker compose logs --tail 30 backend
