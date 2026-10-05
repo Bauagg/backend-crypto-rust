@@ -75,7 +75,6 @@ Pemanggilan API luar **tidak** ditulis di service — selalu lewat `src/clients/
    | `MARKET_API_BASE_URL`, `MARKET_WS_BASE_URL` | Binance (atau Tokocrypto sebagai cadangan) |
    | `STRATEGY_API_BASE_URL` | API strategi Python, default `http://localhost:8080` |
    | `COINGECKO_API_URL`, `FNG_API_URL` | sumber market cap & Fear & Greed |
-   | `SYSTEM_USER_ID` | UUID user pemilik coin yang dibuat otomatis oleh sync — **daftarkan 1 user dulu**, lalu isi ID-nya |
 
 2. Jalankan Redis (sekali saja, selanjutnya ikut jalan otomatis bersama Docker):
 
@@ -159,7 +158,7 @@ Tes WebSocket di Postman: **New → WebSocket**, isi `ws://localhost:<PORT>/api/
 | `Gagal bind port` | port sudah dipakai proses lain |
 | `/market/recommendations` → "Layanan rekomendasi sedang tidak bisa dihubungi" | API Python belum jalan |
 | Rekomendasi tidak berubah setelah respons Python diubah | masih cache Redis (maks 1 jam) — hapus key `recommendations:*` |
-| Coin baru dari sync tidak masuk | `SYSTEM_USER_ID` kosong / user-nya tidak ada |
+| Coin baru dari sync tidak masuk | akun System gagal dibuat saat start — cek log `Gagal menyiapkan akun System` (akun `system@system.local` dibuat otomatis, tidak perlu diisi di `.env`) |
 
 ## Catatan deploy
 

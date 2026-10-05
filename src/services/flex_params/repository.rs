@@ -1,8 +1,11 @@
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
 
 use super::model::FlexParam;
 use crate::utils::app_error::AppError;
+use crate::utils::query_filter::{
+    push_filters, push_order_by, FilterColumn, FilterCondition, SortCondition,
+};
 
 pub async fn find_flex_param_by_type_and_value(
     tx: &mut Transaction<'_, Postgres>,
@@ -185,17 +188,59 @@ pub async fn restore_flex_param(
     Ok(())
 }
 
-pub async fn find_flex_params_by_header_id(
+/// Cakupan data list: semua, atau dikunci ke 1 `type_param` / 1 `header_id` dari path URL.
+pub enum FlexParamScope<'a> {
+    All,
+    Type(&'a str),
+    Header(Uuid),
+}
+
+/// `WHERE` dasar (belum dihapus + cakupan) lalu filter dinamis dari user.
+fn push_flex_param_conditions(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    scope: &FlexParamScope<'_>,
+    filters: &[FilterCondition],
+    columns: &[FilterColumn],
+) -> Result<(), AppError> {
+    builder.push(" WHERE deleted_at IS NULL");
+    match scope {
+        FlexParamScope::All => {}
+        FlexParamScope::Type(type_param) => {
+            builder.push(" AND type_param = ").push_bind(type_param.to_string());
+        }
+        FlexParamScope::Header(header_id) => {
+            builder.push(" AND header_id = ").push_bind(*header_id);
+        }
+    }
+    push_filters(builder, filters, columns)
+}
+
+/// List flex params dengan filter & sort dinamis + pagination. Balik `(data halaman ini, total)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn find_flex_params_paginated(
     tx: &mut Transaction<'_, Postgres>,
-    header_id: Uuid,
-) -> Result<Vec<FlexParam>, AppError> {
-    let params = sqlx::query_as::<_, FlexParam>(
-        "SELECT * FROM flex_params WHERE header_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
-    )
-    .bind(header_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(params)
+    scope: FlexParamScope<'_>,
+    filters: &[FilterCondition],
+    sort: Option<&SortCondition>,
+    columns: &[FilterColumn],
+    default_order: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<FlexParam>, i64), AppError> {
+    let mut query = QueryBuilder::<Postgres>::new("SELECT * FROM flex_params");
+    push_flex_param_conditions(&mut query, &scope, filters, columns)?;
+    push_order_by(&mut query, sort, columns, default_order)?;
+    query.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+    let params = query
+        .build_query_as::<FlexParam>()
+        .fetch_all(&mut **tx)
+        .await?;
+
+    let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM flex_params");
+    push_flex_param_conditions(&mut count, &scope, filters, columns)?;
+    let (total,): (i64,) = count.build_query_as().fetch_one(&mut **tx).await?;
+
+    Ok((params, total))
 }
 
 #[allow(clippy::too_many_arguments)]

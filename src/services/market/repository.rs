@@ -154,8 +154,10 @@ pub async fn store_closed(
 
 /// Simpan candle yang sedang berjalan (dari stream). TTL pendek: key ini hanya ada selama stream
 /// untuk simbol+interval itu hidup, jadi keberadaannya sekaligus tanda datanya segar.
-pub async fn store_live(redis: &RedisPool, symbol: &str, interval: &str, candle: &Candle) {
-    let (Ok(mut conn), Ok(payload)) = (redis.get().await, serde_json::to_string(candle)) else {
+/// `payload` = JSON `Candle` yang sudah di-serialize pemanggil (dipakai juga untuk dikirim ke
+/// client), supaya tiap event cukup di-serialize sekali.
+pub async fn store_live(redis: &RedisPool, symbol: &str, interval: &str, payload: &str) {
+    let Ok(mut conn) = redis.get().await else {
         return;
     };
     let _: Result<(), _> = conn

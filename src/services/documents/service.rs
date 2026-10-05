@@ -16,9 +16,10 @@ fn base_url() -> String {
 }
 
 /// Simpan bytes file ke disk dengan nama unik (UUID + extension asli), lalu kembalikan URL publiknya.
-fn save_file_to_disk(original_name: &str, bytes: &[u8]) -> Result<String, AppError> {
+async fn save_file_to_disk(original_name: &str, bytes: &[u8]) -> Result<String, AppError> {
     let dir = upload_dir();
-    std::fs::create_dir_all(&dir)
+    tokio::fs::create_dir_all(&dir)
+        .await
         .map_err(|_| AppError::Internal("Gagal membuat folder upload".to_string()))?;
 
     let ext = std::path::Path::new(original_name)
@@ -32,7 +33,8 @@ fn save_file_to_disk(original_name: &str, bytes: &[u8]) -> Result<String, AppErr
     };
 
     let file_path = dir.join(&unique_name);
-    std::fs::write(&file_path, bytes)
+    tokio::fs::write(&file_path, bytes)
+        .await
         .map_err(|_| AppError::Internal("Gagal menyimpan file ke disk".to_string()))?;
 
     let upload_folder = std::env::var("PATH_FILE_UPLOAD").unwrap_or_else(|_| "files".to_string());
@@ -41,14 +43,12 @@ fn save_file_to_disk(original_name: &str, bytes: &[u8]) -> Result<String, AppErr
 }
 
 /// Hapus file fisik dari disk berdasarkan URL publiknya. Tidak error kalau file sudah tidak ada.
-fn delete_file_from_disk(file_url: &str) {
+async fn delete_file_from_disk(file_url: &str) {
     let Some(unique_name) = file_url.rsplit('/').next() else {
         return;
     };
-    let path = upload_dir().join(unique_name);
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
+    // File yang sudah tidak ada = error NotFound, sengaja diabaikan.
+    let _ = tokio::fs::remove_file(upload_dir().join(unique_name)).await;
 }
 
 pub struct UploadInput {
@@ -64,7 +64,7 @@ pub async fn upload_file_service(
     meta: FileMetaInput,
     created_by: &str,
 ) -> Result<FileRecord, AppError> {
-    let file_url = save_file_to_disk(&upload.original_name, &upload.bytes)?;
+    let file_url = save_file_to_disk(&upload.original_name, &upload.bytes).await?;
 
     create_file(
         tx,
@@ -105,8 +105,8 @@ pub async fn update_file_service(
 
     let (file_name, file_url, file_type) = match new_upload {
         Some(upload) => {
-            delete_file_from_disk(&existing.file_url);
-            let new_url = save_file_to_disk(&upload.original_name, &upload.bytes)?;
+            delete_file_from_disk(&existing.file_url).await;
+            let new_url = save_file_to_disk(&upload.original_name, &upload.bytes).await?;
             (upload.original_name, new_url, upload.mime_type)
         }
         None => (existing.file_name, existing.file_url, existing.file_type),
@@ -125,7 +125,7 @@ pub async fn delete_file_service(
         .ok_or_else(|| AppError::NotFound("Dokumen tidak ditemukan".to_string()))?;
 
     soft_delete_file(tx, id, deleted_by).await?;
-    delete_file_from_disk(&existing.file_url);
+    delete_file_from_disk(&existing.file_url).await;
 
     Ok(())
 }

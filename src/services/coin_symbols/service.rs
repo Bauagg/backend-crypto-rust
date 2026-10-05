@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use sqlx::{Postgres, Transaction};
-use uuid::Uuid;
+use futures_util::stream::{self, StreamExt};
+use sqlx::{PgPool, Postgres, Transaction};
 
 use super::types::{CoinGeckoCoin, SyncSummary};
 use crate::clients::{binance, coingecko};
@@ -13,12 +13,15 @@ use crate::services::flex_params::service::{
     create_flex_param_service, update_flex_param_service, PhotoUpload,
 };
 use crate::services::flex_params::types::{CreateFlexParamInput, UpdateFlexParamInput};
+use crate::services::users::service::system_user_id;
 use crate::utils::app_error::AppError;
 use crate::utils::http_client::get_bytes;
 
 const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
 const QUOTE_ASSET: &str = "USDT";
 const SYSTEM_ACTOR: &str = "system";
+/// Logo yang diunduh bersamaan dari CoinGecko (CDN gambar, bukan API ber-rate-limit).
+const LOGO_DOWNLOAD_CONCURRENCY: usize = 8;
 /// `description` SIMBOL_CRYPTO = kategori market cap (`Large`/`Mid`/`Small`), dibaca API Python
 /// (backtes-crypto) untuk menentukan universe strategi. Dihitung dari market cap CoinGecko.
 const LARGE_CAP_MIN_USD: f64 = 50_000_000_000.0;
@@ -82,11 +85,6 @@ fn market_cap_category(market_cap: f64) -> &'static str {
         cap if cap >= MID_CAP_MIN_USD => "Mid",
         _ => DEFAULT_MARKET_CAP_CATEGORY,
     }
-}
-
-/// UUID user pemilik baris yang dibuat otomatis oleh sync (`flex_params.user_id` wajib diisi).
-fn system_user_id() -> Option<Uuid> {
-    std::env::var("SYSTEM_USER_ID").ok().and_then(|v| Uuid::parse_str(v.trim()).ok())
 }
 
 /// Pair USDT spot yang sedang TRADING di exchange, dipetakan ke base asset-nya. Simbol non-ASCII
@@ -166,9 +164,10 @@ async fn download_logo(symbol: &str, image_url: Option<&str>) -> Option<PhotoUpl
 /// `description` (kategori market cap) dihitung ulang dari CoinGecko, kecuali basket
 /// `LOCKED_SYMBOLS`. CoinGecko wajib berhasil — tanpanya saham & crypto tidak bisa
 /// dibedakan, jadi sync dibatalkan (dicoba lagi di putaran berikutnya).
-pub async fn sync_coin_symbols_service(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<SyncSummary, AppError> {
+///
+/// Bagian lambat (exchange, CoinGecko, unduh logo) dikerjakan di luar transaksi DB; logo diunduh
+/// paralel. Transaksi hanya membungkus penulisan di akhir, jadi koneksi DB tidak tertahan bermenit-menit.
+pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, AppError> {
     let trading_pairs = fetch_trading_pairs().await?;
     let volumes = fetch_volumes().await?;
     let coingecko = fetch_coingecko_coins().await?;
@@ -206,25 +205,65 @@ pub async fn sync_coin_symbols_service(
 
     let mut summary = SyncSummary::default();
 
-    // 1. Pulihkan yang dulu dihapus sistem tapi kini coin besar lagi. Hasil query terurut
-    //    terbaru dulu per simbol — cukup lihat penghapusan terakhirnya.
-    let mut known: HashSet<String> = find_flex_params_by_type(tx, SYMBOL_TYPE_PARAM, false)
-        .await?
-        .into_iter()
-        .map(|p| p.value_param)
-        .collect();
+    // Baca keadaan DB sekarang (transaksi singkat) untuk tahu logo mana yang perlu diunduh.
+    let (live, deleted) = {
+        let mut tx = begin(pool).await?;
+        let live = find_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM, false).await?;
+        let deleted = find_deleted_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM).await?;
+        let _ = tx.commit().await;
+        (live, deleted)
+    };
 
-    for (id, symbol, deleted_by, has_photo) in
-        find_deleted_flex_params_by_type(tx, SYMBOL_TYPE_PARAM).await?
-    {
+    // Pulihkan yang dulu dihapus sistem tapi kini coin besar lagi. Hasil query terurut terbaru dulu
+    // per simbol — cukup lihat penghapusan terakhirnya.
+    let mut known: HashSet<String> = live.iter().map(|p| p.value_param.clone()).collect();
+    let mut to_restore = Vec::new();
+    for (id, symbol, deleted_by, has_photo) in deleted {
         if !known.insert(symbol.clone()) {
             continue;
         }
         let should_restore = LOCKED_SYMBOLS.contains(&symbol.as_str()) || can_enter(&symbol);
         if deleted_by.as_deref() == Some(SYSTEM_ACTOR) && should_restore {
-            restore_flex_param(tx, id, has_photo, SYSTEM_ACTOR).await?;
-            summary.restored += 1;
+            to_restore.push((id, symbol, has_photo));
         }
+    }
+
+    let mut new_symbols: Vec<&String> = trading_pairs
+        .keys()
+        .filter(|symbol| !known.contains(*symbol) && can_enter(symbol))
+        .collect();
+    new_symbols.sort();
+
+    // Logo yang dibutuhkan: coin hidup tanpa foto (yang tetap layak), coin yang dipulihkan tanpa
+    // foto, dan coin baru — semuanya diunduh paralel di luar transaksi.
+    let mut need_logo: Vec<String> = live
+        .iter()
+        .filter(|p| p.photo_url.is_none() && can_stay(&p.value_param))
+        .map(|p| p.value_param.clone())
+        .collect();
+    need_logo.extend(to_restore.iter().filter(|(_, _, has_photo)| !has_photo).map(|(_, s, _)| s.clone()));
+    need_logo.extend(new_symbols.iter().map(|s| (*s).clone()));
+    let mut logos: HashMap<String, PhotoUpload> = stream::iter(need_logo)
+        .map(|symbol| {
+            let url = logo_url_of(&symbol).map(str::to_string);
+            async move {
+                let photo = download_logo(&symbol, url.as_deref()).await;
+                (symbol, photo)
+            }
+        })
+        .buffer_unordered(LOGO_DOWNLOAD_CONCURRENCY)
+        .filter_map(|(symbol, photo)| async move { photo.map(|p| (symbol, p)) })
+        .collect()
+        .await;
+
+    // Semua penulisan dalam 1 transaksi singkat — tidak ada request ke luar di dalamnya.
+    let mut tx_owned = begin(pool).await?;
+    let tx = &mut tx_owned;
+
+    // 1. Pulihkan.
+    for (id, _, has_photo) in &to_restore {
+        restore_flex_param(tx, *id, *has_photo, SYSTEM_ACTOR).await?;
+        summary.restored += 1;
     }
 
     // 2. Semua baris hidup (termasuk yang baru dipulihkan): hapus yang tidak layak tetap, lengkapi
@@ -239,7 +278,7 @@ pub async fn sync_coin_symbols_service(
 
         let photo = match param.photo_url {
             Some(_) => None,
-            None => download_logo(symbol, logo_url_of(symbol)).await,
+            None => logos.remove(symbol),
         };
         let has_photo = param.photo_url.is_some() || photo.is_some();
         let new_category = Some(category_of(symbol))
@@ -266,23 +305,19 @@ pub async fn sync_coin_symbols_service(
     }
 
     // 3. Coin besar yang belum pernah ada sama sekali — langsung dengan logo CoinGecko.
-    let mut new_symbols: Vec<&String> = trading_pairs
-        .keys()
-        .filter(|symbol| !known.contains(*symbol) && can_enter(symbol))
-        .collect();
-    new_symbols.sort();
-
     if !new_symbols.is_empty() {
+        // Pemilik baris yang dibuat otomatis (`flex_params.user_id` wajib diisi) = akun System.
         let Some(user_id) = system_user_id() else {
             tracing::warn!(
-                "SYSTEM_USER_ID belum di-set/tidak valid di .env, {} coin baru dilewati",
+                "Akun System belum tersedia, {} coin baru dilewati",
                 new_symbols.len()
             );
+            commit(tx_owned).await?;
             return Ok(summary);
         };
 
         for symbol in new_symbols {
-            let photo = download_logo(symbol, logo_url_of(symbol)).await;
+            let photo = logos.remove(symbol.as_str());
             if photo.is_some() {
                 summary.photos += 1;
             }
@@ -299,5 +334,18 @@ pub async fn sync_coin_symbols_service(
         }
     }
 
+    commit(tx_owned).await?;
     Ok(summary)
+}
+
+async fn begin(pool: &PgPool) -> Result<Transaction<'_, Postgres>, AppError> {
+    pool.begin()
+        .await
+        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
+}
+
+async fn commit(tx: Transaction<'_, Postgres>) -> Result<(), AppError> {
+    tx.commit()
+        .await
+        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
 }

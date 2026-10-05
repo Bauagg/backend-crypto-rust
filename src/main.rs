@@ -15,13 +15,25 @@ async fn main() {
     dotenvy::dotenv().ok();
     let _log_guard = config::logger::init();
 
+    // Secret dibaca & divalidasi sekali di sini: env kosong = server gagal start dengan pesan jelas.
+    utils::jwt::init().expect("Konfigurasi JWT tidak valid");
+    utils::crypto::init().expect("Konfigurasi ENCRYPTION_KEY tidak valid");
+
     let pool = database::connect().await;
     let redis_pool = database::connect_redis().await;
     let kline_hub = services::market::stream_hub::KlineHub::new(redis_pool.clone());
+    let ticker_hub = services::market::ticker_hub::TickerHub::new();
+
+    // Akun System (pemilik data buatan server) harus ada sebelum worker sync jalan.
+    if let Err(err) = services::users::service::ensure_system_user(&pool).await {
+        tracing::error!("Gagal menyiapkan akun System: {err:?}");
+    }
 
     // Background worker: jalan terus selama server hidup, tidak menunda server siap menerima request.
     tokio::spawn(start_market_workers(pool.clone()));
+    tokio::spawn(ticker_hub.clone().run(pool.clone()));
     tokio::spawn(services::fear_greed::worker::start(pool.clone()));
+    tokio::spawn(services::transactions::worker::start(pool.clone()));
 
     let upload_folder = std::env::var("PATH_FILE_UPLOAD").unwrap_or_else(|_| "files".to_string());
     let upload_folder = upload_folder.trim().to_string();
@@ -33,6 +45,7 @@ async fn main() {
         .with_state(pool)
         .layer(Extension(redis_pool))
         .layer(Extension(kline_hub))
+        .layer(Extension(ticker_hub))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 

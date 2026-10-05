@@ -1,0 +1,10 @@
+# Jangan ikut dikirim ke Docker build: hasil build lokal, data runtime, dan secret.
+target
+files
+logs
+.env
+.env.*
+!.env.docker.example
+.git
+.claude
+*.md

@@ -90,28 +90,47 @@ pub async fn find_latest_open_times(
     Ok(rows.into_iter().collect())
 }
 
-/// Ambil `limit` candle TERAKHIR untuk 1 simbol+interval, tapi dikembalikan terurut lama->baru
-/// (ASC) — dipakai `market::service` untuk fallback harga dari candle tersimpan.
-pub async fn find_recent_candles_asc(
+/// Harga `close` 2 candle terakhir untuk BANYAK simbol dalam 1 query (bukan 1 query per simbol).
+/// Balik `simbol -> (close terakhir, close sebelumnya kalau ada)`.
+///
+/// `LATERAL ... LIMIT 2` per simbol: index `(symbol, interval, open_time)` dibaca mundur dan
+/// berhenti setelah 2 baris — tidak membaca & mengurutkan seluruh histori candle tiap simbol
+/// (63 simbol: ±1 ms vs ±120 ms dengan window function di seluruh tabel).
+pub async fn find_last_two_closes(
     pool: &PgPool,
-    symbol: &str,
+    symbols: &[String],
     interval: &str,
-    limit: i64,
-) -> Result<Vec<CandleOhlcv>, AppError> {
-    let mut candles = sqlx::query_as::<_, CandleOhlcv>(
+) -> Result<HashMap<String, (rust_decimal::Decimal, Option<rust_decimal::Decimal>)>, AppError> {
+    if symbols.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, rust_decimal::Decimal, i64)> = sqlx::query_as(
         r#"
-        SELECT * FROM candle_ohlcv
-        WHERE symbol = $1 AND interval = $2
-        ORDER BY open_time DESC
-        LIMIT $3
+        SELECT s.symbol, c.close, c.rn
+        FROM unnest($2::text[]) AS s(symbol)
+        CROSS JOIN LATERAL (
+            SELECT close, ROW_NUMBER() OVER (ORDER BY open_time DESC) AS rn
+            FROM candle_ohlcv
+            WHERE symbol = s.symbol AND interval = $1
+            ORDER BY open_time DESC
+            LIMIT 2
+        ) c
         "#,
     )
-    .bind(symbol)
     .bind(interval)
-    .bind(limit)
+    .bind(symbols)
     .fetch_all(pool)
     .await?;
 
-    candles.reverse();
-    Ok(candles)
+    let mut closes: HashMap<String, (rust_decimal::Decimal, Option<rust_decimal::Decimal>)> =
+        HashMap::new();
+    for (symbol, close, rn) in rows {
+        let entry = closes.entry(symbol).or_insert((close, None));
+        if rn == 1 {
+            entry.0 = close;
+        } else {
+            entry.1 = Some(close);
+        }
+    }
+    Ok(closes)
 }

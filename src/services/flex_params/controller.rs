@@ -3,16 +3,15 @@ use axum::{
     response::Response,
     Extension,
 };
-use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::repository::FlexParamScope;
 use super::service::{
-    create_flex_param_service, delete_flex_param_service, get_all_flex_params_service,
-    get_flex_param_by_id_service, get_flex_params_by_header_id_service,
-    get_flex_params_by_type_service, update_flex_param_service, PhotoUpload,
+    create_flex_param_service, delete_flex_param_service, get_flex_param_by_id_service,
+    get_flex_params_list_service, update_flex_param_service, PhotoUpload,
 };
-use super::types::{CreateFlexParamInput, UpdateFlexParamInput};
+use super::types::{CreateFlexParamInput, ListQueryOptions, UpdateFlexParamInput};
 use crate::utils::api_response::{created, paginated, success, PaginationParams};
 use crate::utils::app_error::AppError;
 use crate::utils::jwt::JwtClaims;
@@ -149,42 +148,37 @@ pub async fn create_flex_param(
     Ok(created(result, "Flex param berhasil dibuat"))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ListQuery {
-    pub type_param: Option<String>,
-    /// Cari berdasarkan value_param, partial match (contoh: search=BTC cocok dengan BTCUSDT).
-    pub search: Option<String>,
-    pub page: Option<i64>,
-    pub limit: Option<i64>,
-}
-
-pub async fn get_all_flex_params(
-    State(pool): State<PgPool>,
-    Query(query): Query<ListQuery>,
+/// Dipakai bersama 3 endpoint list (semua / by type / by header): filter & sort dinamis +
+/// pagination, lihat `ListQueryOptions`.
+async fn list_flex_params(
+    pool: &PgPool,
+    scope: FlexParamScope<'_>,
+    query: ListQueryOptions,
+    message: &str,
 ) -> Result<Response, AppError> {
     let pagination = PaginationParams::parse(query.page, query.limit);
     let offset = (pagination.page - 1) * pagination.limit;
 
-    let mut tx = begin_tx(&pool).await?;
+    let mut tx = begin_tx(pool).await?;
 
-    let (params, total) = match get_all_flex_params_service(
-        &mut tx,
-        query.type_param.as_deref(),
-        query.search.as_deref(),
-        pagination.limit,
-        offset,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
+    let (params, total) =
+        match get_flex_params_list_service(&mut tx, scope, &query, pagination.limit, offset).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        };
 
     commit_tx(tx).await?;
-    Ok(paginated(params, total, &pagination, "Berhasil mengambil data flex params"))
+    Ok(paginated(params, total, &pagination, message))
+}
+
+pub async fn get_all_flex_params(
+    State(pool): State<PgPool>,
+    Query(query): Query<ListQueryOptions>,
+) -> Result<Response, AppError> {
+    list_flex_params(&pool, FlexParamScope::All, query, "Berhasil mengambil data flex params").await
 }
 
 pub async fn get_flex_param_by_id(
@@ -205,48 +199,32 @@ pub async fn get_flex_param_by_id(
     Ok(success(result, "Berhasil mengambil flex param"))
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct TypeQuery {
-    /// `true` -> hanya tampilkan yang aktif. Tidak diisi/`false` -> tampilkan semua (aktif & tidak aktif).
-    #[serde(default)]
-    pub is_active: bool,
-}
-
 pub async fn get_flex_params_by_type(
     State(pool): State<PgPool>,
     Path(type_param): Path<String>,
-    Query(query): Query<TypeQuery>,
+    Query(query): Query<ListQueryOptions>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match get_flex_params_by_type_service(&mut tx, &type_param, query.is_active).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
-    Ok(success(result, "Berhasil mengambil flex params by type"))
+    list_flex_params(
+        &pool,
+        FlexParamScope::Type(&type_param),
+        query,
+        "Berhasil mengambil flex params by type",
+    )
+    .await
 }
 
 pub async fn get_flex_params_by_header_id(
     State(pool): State<PgPool>,
     Path(header_id): Path<Uuid>,
+    Query(query): Query<ListQueryOptions>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match get_flex_params_by_header_id_service(&mut tx, header_id).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
-    Ok(success(result, "Berhasil mengambil flex params by header id"))
+    list_flex_params(
+        &pool,
+        FlexParamScope::Header(header_id),
+        query,
+        "Berhasil mengambil flex params by header id",
+    )
+    .await
 }
 
 pub async fn update_flex_param(

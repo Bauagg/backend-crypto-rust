@@ -1,0 +1,110 @@
+# Backend Rust + Postgres + Redis (+ Dozzle opsional untuk melihat log di browser).
+#
+#   cp .env.docker.example .env.docker   # isi password & secret
+#   docker compose up -d --build         # jalankan
+#   docker compose --profile tools up -d # + Dozzle (log viewer) di http://127.0.0.1:8888
+#
+# Semua konfigurasi aplikasi di `.env.docker` (bukan `.env` — itu untuk jalan lokal tanpa Docker,
+# host DB/Redis-nya `localhost`; di Docker host-nya nama service: `postgres`, `redis`).
+
+# Batas log per container: maks 3 file × 10 MB, yang lama otomatis terhapus — disk tidak penuh.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  backend:
+    build: .
+    image: backend-treding-rust:latest
+    container_name: treding-backend
+    restart: unless-stopped
+    env_file: .env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Hanya bisa diakses dari VPS itu sendiri (Cloudflare Tunnel / Nginx di host meneruskan ke
+    # sini). Port 8000 tidak terbuka ke internet.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Foto/logo upload — harus tetap ada walau container dibuat ulang.
+      - uploads:/app/files
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    logging: *default-logging
+    networks: [treding]
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: treding-postgres
+    restart: unless-stopped
+    env_file: .env.docker
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    logging: *default-logging
+    networks: [treding]
+
+  # Redis hanya cache (chart/klines, rekomendasi) — tidak perlu disimpan ke disk. Kalau memori
+  # penuh, data paling jarang dipakai dibuang otomatis.
+  redis:
+    image: redis:7-alpine
+    container_name: treding-redis
+    restart: unless-stopped
+    env_file: .env.docker
+    command: >
+      sh -c 'exec redis-server --requirepass "$$REDIS_PASSWORD"
+      --maxmemory 128mb --maxmemory-policy allkeys-lru --save "" --appendonly no'
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 160m
+    logging: *default-logging
+    networks: [treding]
+
+  # Log viewer di browser (opsional): `docker compose --profile tools up -d`. Dibuka lewat
+  # http://127.0.0.1:8888 di VPS (atau SSH tunnel: ssh -L 8888:127.0.0.1:8888 user@vps).
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: treding-dozzle
+    restart: unless-stopped
+    profiles: [tools]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:8888:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+    logging: *default-logging
+
+volumes:
+  pgdata:
+  uploads:
+
+# Nama network tetap supaya container API Python (repo backtes-crypto) bisa ikut bergabung:
+#   networks: { treding: { external: true, name: treding-net } }
+# lalu di `.env.docker`: STRATEGY_API_BASE_URL=http://<nama-service-python>:8080
+networks:
+  treding:
+    name: treding-net

@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -7,11 +9,19 @@ use crate::utils::app_error::AppError;
 
 const NONCE_LEN: usize = 12;
 
+static CIPHER: OnceLock<Aes256Gcm> = OnceLock::new();
+
 /// Key diambil dari env `ENCRYPTION_KEY`, harus persis 32 byte (bisa berupa string biasa,
-/// dipad/dipotong ke 32 byte). Dipakai untuk enkripsi/dekripsi `api_secret` milik exchange.
-fn cipher() -> Result<Aes256Gcm, AppError> {
+/// dipad/dipotong ke 32 byte). Dipakai untuk enkripsi/dekripsi `api_key` & `api_secret` exchange.
+/// Dibaca sekali saja, lalu dipakai ulang.
+fn cipher() -> Result<&'static Aes256Gcm, AppError> {
+    if let Some(cipher) = CIPHER.get() {
+        return Ok(cipher);
+    }
     let raw_key = std::env::var("ENCRYPTION_KEY")
-        .map_err(|_| AppError::Internal("ENCRYPTION_KEY tidak ditemukan di .env".to_string()))?;
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| AppError::Internal("ENCRYPTION_KEY tidak ditemukan di .env".to_string()))?;
 
     let mut key_bytes = [0u8; 32];
     let raw = raw_key.as_bytes();
@@ -19,7 +29,13 @@ fn cipher() -> Result<Aes256Gcm, AppError> {
     key_bytes[..len].copy_from_slice(&raw[..len]);
 
     let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    Ok(Aes256Gcm::new(key))
+    Ok(CIPHER.get_or_init(|| Aes256Gcm::new(key)))
+}
+
+/// Baca kunci enkripsi saat server start — env kosong = server gagal start, bukan error saat
+/// user menyimpan/memakai API key.
+pub fn init() -> Result<(), AppError> {
+    cipher().map(|_| ())
 }
 
 /// Enkripsi plaintext (mis. api_secret exchange) -> base64(nonce || ciphertext).
@@ -42,8 +58,7 @@ pub fn encrypt(plaintext: &str) -> Result<String, AppError> {
 }
 
 /// Dekripsi hasil dari `encrypt`, kembalikan plaintext original.
-/// Dipakai nanti oleh service bot trading saat mengambil `api_secret` untuk eksekusi order ke exchange.
-#[allow(dead_code)]
+/// Dipakai saat request ke Binance (key & secret user) dan untuk menyamarkan `api_key` di profil.
 pub fn decrypt(encoded: &str) -> Result<String, AppError> {
     let cipher = cipher()?;
 

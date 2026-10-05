@@ -8,8 +8,10 @@ pub type RedisPool = deadpool_redis::Pool;
 pub async fn connect() -> PgPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL tidak ditemukan di .env");
 
+    // Pool penuh -> request gagal cepat (503-ish) setelah 5 detik, tidak menggantung 30 detik.
     let pool = PgPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(&url)
         .await
         .expect("Gagal konek ke database");

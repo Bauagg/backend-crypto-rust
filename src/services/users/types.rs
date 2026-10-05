@@ -115,4 +115,7 @@ pub struct UpdateProfileInput {
     pub is_robot_demo_active: Option<bool>,
     /// Nyalakan/matikan robot trading di akun real/platform.
     pub is_robot_platform_active: Option<bool>,
+
+    /// Mata uang pilihan: `IDR` | `USDT` (dicek di service).
+    pub preferred_currency: Option<String>,
 }

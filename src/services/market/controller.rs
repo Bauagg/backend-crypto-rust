@@ -9,23 +9,14 @@ use sqlx::PgPool;
 
 use super::service::{get_klines_service, get_recommendations_service, get_symbols_service};
 use super::stream_hub::KlineHub;
-use super::types::{is_valid_interval, KlinesQuery, RecommendationQuery, SymbolsQuery, WsKlineQuery};
-use super::websocket::relay_kline_stream;
+use super::ticker_hub::TickerHub;
+use super::types::{
+    is_valid_interval, KlinesQuery, RecommendationQuery, SymbolsQuery, WsKlineQuery, WsTickersQuery,
+};
+use super::websocket::{relay_kline_stream, relay_ticker_stream};
 use crate::database::RedisPool;
 use crate::utils::api_response::{paginated, success, PaginationParams};
 use crate::utils::app_error::AppError;
-
-async fn begin_tx(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
-}
-
-async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
-}
 
 pub async fn get_klines(
     Extension(redis): Extension<RedisPool>,
@@ -37,29 +28,20 @@ pub async fn get_klines(
 
 pub async fn get_symbols(
     State(pool): State<PgPool>,
+    Extension(ticker_hub): Extension<Arc<TickerHub>>,
     Query(query): Query<SymbolsQuery>,
 ) -> Result<Response, AppError> {
     let pagination = PaginationParams::parse(query.page, query.limit);
     let offset = (pagination.page - 1) * pagination.limit;
-    let mut tx = begin_tx(&pool).await?;
 
-    let (symbols, total) = match get_symbols_service(
+    let (symbols, total) = get_symbols_service(
         &pool,
-        &mut tx,
+        &ticker_hub,
         query.search.as_deref(),
         pagination.limit,
         offset,
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    .await?;
     Ok(paginated(symbols, total, &pagination, "Berhasil mengambil daftar pair"))
 }
 
@@ -93,4 +75,23 @@ pub async fn ws_klines(
     let symbol = query.symbol.trim().to_uppercase();
 
     Ok(ws.on_upgrade(move |socket| relay_kline_stream(socket, hub, symbol, interval)))
+}
+
+/// Upgrade ke WebSocket harga live daftar coin (`TickerHub`: 1 koneksi exchange untuk semua coin
+/// & semua client). Simbol awal opsional lewat query; ganti kapan saja dengan pesan
+/// `{"symbols":["BTCUSDT","ETHUSDT"]}`.
+/// Contoh: GET /api/market/ws/tickers?symbols=BTCUSDT,ETHUSDT (upgrade header WebSocket).
+pub async fn ws_tickers(
+    ws: WebSocketUpgrade,
+    Extension(hub): Extension<Arc<TickerHub>>,
+    Query(query): Query<WsTickersQuery>,
+) -> Response {
+    let initial: Vec<String> = query
+        .symbols
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_string)
+        .collect();
+
+    ws.on_upgrade(move |socket| relay_ticker_stream(socket, hub, initial))
 }

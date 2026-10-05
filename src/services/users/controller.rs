@@ -127,6 +127,9 @@ async fn parse_update_profile_multipart(
             "platform" => input.platform = non_empty(field.text().await.unwrap_or_default()),
             "api_key" => input.api_key = non_empty(field.text().await.unwrap_or_default()),
             "api_secret" => input.api_secret = non_empty(field.text().await.unwrap_or_default()),
+            "preferred_currency" => {
+                input.preferred_currency = non_empty(field.text().await.unwrap_or_default())
+            }
             "demo_balance" => {
                 let value = field.text().await.unwrap_or_default();
                 input.demo_balance = Decimal::from_str(&value).ok();
@@ -168,17 +171,8 @@ pub async fn update_profile(
     let user_id = parse_user_id(&claims)?;
     let (input, photo) = parse_update_profile_multipart(multipart).await?;
 
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match update_profile_service(&mut tx, user_id, input, photo).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    // Transaksi diatur di service: verifikasi ke Binance dulu (tanpa tx), baru tulis ke DB.
+    let result = update_profile_service(&pool, user_id, input, photo).await?;
     Ok(success(result, "Profil berhasil diupdate"))
 }
 

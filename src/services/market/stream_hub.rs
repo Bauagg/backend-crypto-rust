@@ -89,12 +89,12 @@ impl KlineHub {
                             continue;
                         };
                         let candle = Candle::from(event);
-                        self.write_to_cache(symbol, interval, &candle).await;
+                        // Serialize sekali, dipakai untuk cache Redis & dikirim ke client.
+                        let Ok(payload) = serde_json::to_string(&candle) else { continue };
+                        self.write_to_cache(symbol, interval, &candle, &payload).await;
 
-                        if let Ok(payload) = serde_json::to_string(&candle) {
-                            // Gagal kirim = sedang tidak ada client; dicek di bawah.
-                            let _ = sender.send(Arc::new(payload));
-                        }
+                        // Gagal kirim = sedang tidak ada client; dicek di bawah.
+                        let _ = sender.send(Arc::new(payload));
                         if sender.receiver_count() == 0 && self.remove_if_unused(&key, &sender) {
                             return;
                         }
@@ -111,12 +111,13 @@ impl KlineHub {
         }
     }
 
-    async fn write_to_cache(&self, symbol: &str, interval: &str, candle: &Candle) {
+    async fn write_to_cache(&self, symbol: &str, interval: &str, candle: &Candle, payload: &str) {
         if candle.is_closed {
+            // Hanya 1x per candle (saat close) — tetap lewat jalur histori yang sama dengan REST.
             repository::store_closed(&self.redis, symbol, interval, std::slice::from_ref(candle), false)
                 .await;
         } else {
-            repository::store_live(&self.redis, symbol, interval, candle).await;
+            repository::store_live(&self.redis, symbol, interval, payload).await;
         }
     }
 }

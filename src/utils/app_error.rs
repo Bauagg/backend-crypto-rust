@@ -87,20 +87,31 @@ impl From<validator::ValidationErrors> for AppError {
     }
 }
 
+/// Pesan ke user tetap umum, tapi error asli ditulis ke log supaya bisa dilacak di produksi.
 impl From<sqlx::Error> for AppError {
     fn from(err: sqlx::Error) -> Self {
         match &err {
             sqlx::Error::RowNotFound => AppError::NotFound("Data tidak ditemukan".to_string()),
             sqlx::Error::Database(db_err) => {
                 if db_err.is_unique_violation() {
+                    tracing::warn!("Database unique violation: {err}");
                     AppError::Conflict("Data sudah ada".to_string())
                 } else if db_err.is_foreign_key_violation() {
+                    tracing::warn!("Database foreign key violation: {err}");
                     AppError::BadRequest("Referensi data tidak ditemukan".to_string())
                 } else {
+                    tracing::error!("Database error: {err}");
                     AppError::Internal("Terjadi kesalahan pada database".to_string())
                 }
             }
-            _ => AppError::Internal("Terjadi kesalahan pada database".to_string()),
+            sqlx::Error::PoolTimedOut => {
+                tracing::error!("Database pool penuh: {err}");
+                AppError::Internal("Server sedang sibuk, coba lagi sebentar".to_string())
+            }
+            _ => {
+                tracing::error!("Database error: {err}");
+                AppError::Internal("Terjadi kesalahan pada database".to_string())
+            }
         }
     }
 }

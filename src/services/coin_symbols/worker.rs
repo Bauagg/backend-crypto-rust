@@ -18,30 +18,18 @@ pub async fn start(pool: PgPool) {
     }
 }
 
+/// Transaksi DB diatur di service (hanya membungkus penulisan di akhir); gagal di tengah = tidak
+/// ada perubahan yang tersimpan.
 pub async fn sync_once(pool: &PgPool) {
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(err) => {
-            tracing::error!("Gagal memulai transaksi untuk sync coin symbols: {err}");
-            return;
-        }
-    };
-
-    match sync_coin_symbols_service(&mut tx).await {
-        Ok(summary) => match tx.commit().await {
-            Ok(()) => tracing::info!(
-                "Sync coin symbols selesai: {} baru, {} dipulihkan, {} di-soft-delete, {} ganti kategori, {} foto baru",
-                summary.created,
-                summary.restored,
-                summary.deleted,
-                summary.recategorized,
-                summary.photos
-            ),
-            Err(err) => tracing::error!("Gagal commit sync coin symbols: {err}"),
-        },
-        Err(err) => {
-            let _ = tx.rollback().await;
-            tracing::error!("Sync coin symbols gagal: {err:?}");
-        }
+    match sync_coin_symbols_service(pool).await {
+        Ok(summary) => tracing::info!(
+            "Sync coin symbols selesai: {} baru, {} dipulihkan, {} di-soft-delete, {} ganti kategori, {} foto baru",
+            summary.created,
+            summary.restored,
+            summary.deleted,
+            summary.recategorized,
+            summary.photos
+        ),
+        Err(err) => tracing::error!("Sync coin symbols gagal: {err:?}"),
     }
 }

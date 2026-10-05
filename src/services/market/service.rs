@@ -1,16 +1,18 @@
 use chrono::Timelike;
 use deadpool_redis::redis::AsyncCommands;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use std::collections::HashMap;
 
 use super::repository;
+use super::ticker_hub::TickerHub;
 use super::types::{
-    is_valid_interval, Candle, KlinesQuery, MarketSymbol, RecommendationQuery, ALLOWED_INTERVALS,
+    is_valid_interval, Candle, KlinesQuery, MarketSymbol, MarketTicker, RecommendationQuery,
+    ALLOWED_INTERVALS,
 };
 use crate::clients::{binance, strategy_api};
 use crate::database::RedisPool;
-use crate::services::candle_ohlcv::service::get_recent_candles_asc_service;
+use crate::services::candle_ohlcv::repository::find_last_two_closes;
 use crate::services::flex_params::repository::{count_flex_params, find_all_flex_params};
 use crate::utils::app_error::AppError;
 
@@ -20,11 +22,11 @@ const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
 /// yang sama dalam waktu berdekatan (mis. reload halaman FE beruntun).
 const KLINES_CACHE_TTL_SECONDS: u64 = 5;
 
-/// Ticker 24hr SEMUA simbol dalam 1 request — jauh lebih hemat rate limit dibanding fetch
-/// satu-satu per simbol. `None` kalau request gagal (mis. kena rate limit 429); pemanggil
-/// fallback ke candle tersimpan untuk seluruh halaman kalau ini terjadi.
-async fn fetch_all_tickers() -> Option<HashMap<String, binance::Ticker24hr>> {
-    let tickers = match binance::get_tickers_24hr().await {
+/// Ticker 24hr hanya untuk simbol yang diminta, dalam 1 request — bukan ticker semua pair
+/// exchange (±3.500 pair, beberapa MB, sering timeout lewat koneksi lambat). `None` kalau
+/// request gagal (mis. rate limit 429); pemanggil fallback ke candle tersimpan.
+async fn fetch_page_tickers(symbols: &[String]) -> Option<HashMap<String, binance::Ticker24hr>> {
+    let tickers = match binance::get_tickers_24hr_for(symbols).await {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!("Gagal mengambil ticker 24hr dari exchange: {err:?}");
@@ -35,57 +37,90 @@ async fn fetch_all_tickers() -> Option<HashMap<String, binance::Ticker24hr>> {
     Some(tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect())
 }
 
-/// Hitung `last_price` & `price_change_percent` dari 2 candle harian terakhir yang sudah kita
-/// simpan sendiri di `candle_ohlcv` (dikumpulkan `worker`) — dipakai sebagai
-/// fallback kalau bulk ticker exchange gagal (mis. kena rate limit), supaya tidak langsung
-/// jatuh ke "0" selama kita masih punya histori candle simbol tersebut.
-async fn fallback_price_from_candles(pool: &PgPool, symbol: &str) -> Option<(String, String)> {
-    let candles = get_recent_candles_asc_service(pool, symbol, "1d", 2).await.ok()?;
-    let last = candles.last()?;
-    let last_price = last.close;
-
-    let price_change_percent = match candles.len() {
-        2 => {
-            let prev = candles.first()?.close;
-            if prev.is_zero() {
-                rust_decimal::Decimal::ZERO
-            } else {
-                (last_price - prev) / prev * rust_decimal::Decimal::ONE_HUNDRED
-            }
+/// `last_price` & `price_change_percent` dari 2 candle harian terakhir yang kita simpan sendiri
+/// di `candle_ohlcv` — fallback kalau harga exchange gagal didapat, supaya tidak langsung jatuh ke
+/// "0" selama masih punya histori candle. Semua simbol diambil dalam 1 query.
+async fn fallback_prices_from_candles(
+    pool: &PgPool,
+    symbols: &[String],
+) -> HashMap<String, (String, String)> {
+    let closes = match find_last_two_closes(pool, symbols, "1d").await {
+        Ok(closes) => closes,
+        Err(err) => {
+            tracing::warn!("Fallback harga dari candle gagal: {err:?}");
+            return HashMap::new();
         }
-        _ => rust_decimal::Decimal::ZERO,
     };
-
-    Some((last_price.to_string(), price_change_percent.round_dp(2).to_string()))
+    closes
+        .into_iter()
+        .map(|(symbol, (last, prev))| {
+            let change = match prev {
+                Some(prev) if !prev.is_zero() => (last - prev) / prev * rust_decimal::Decimal::ONE_HUNDRED,
+                _ => rust_decimal::Decimal::ZERO,
+            };
+            (symbol, (last.to_string(), change.round_dp(2).to_string()))
+        })
+        .collect()
 }
 
 /// Daftar pair diambil dari `flex_params` (type_param=SIMBOL_CRYPTO) — diedit lewat endpoint
 /// flex-params yang sudah ada, bukan hardcode di kode. Hanya pair yang `is_active` yang ditampilkan,
 /// bisa difilter dengan search (partial match ke symbol) dan dipaginasi. Harga & persentase naik/turun
-/// 24 jam diambil dari 1 kali fetch bulk semua simbol (bukan per simbol) supaya hemat rate limit;
-/// kalau bulk fetch itu gagal, fallback ke candle harian tersimpan sendiri (bisa basi s/d 1 hari,
-/// tapi jauh lebih berguna daripada "0").
+/// 24 jam dibaca dari memori `TickerHub` (live, tanpa request ke exchange). Simbol yang belum ada di
+/// sana (mis. server baru start) diambil lewat 1 fetch REST untuk simbol itu saja; kalau gagal juga,
+/// fallback ke candle harian tersimpan sendiri (bisa basi s/d 1 hari, tapi lebih berguna daripada "0").
+///
+/// Transaksi DB hanya untuk membaca daftar coin, dan sudah selesai sebelum harga diambil — koneksi
+/// DB tidak tertahan selama menunggu exchange.
 pub async fn get_symbols_service(
     pool: &PgPool,
-    tx: &mut Transaction<'_, Postgres>,
+    ticker_hub: &TickerHub,
     search: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<MarketSymbol>, i64), AppError> {
-    let flex_params =
-        find_all_flex_params(tx, Some(SYMBOL_TYPE_PARAM), search, true, limit, offset).await?;
-    let total = count_flex_params(tx, Some(SYMBOL_TYPE_PARAM), search, true).await?;
+    let (flex_params, total) = {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+        let flex_params =
+            find_all_flex_params(&mut tx, Some(SYMBOL_TYPE_PARAM), search, true, limit, offset).await?;
+        let total = count_flex_params(&mut tx, Some(SYMBOL_TYPE_PARAM), search, true).await?;
+        let _ = tx.commit().await;
+        (flex_params, total)
+    };
 
-    let tickers = fetch_all_tickers().await.unwrap_or_default();
+    let page_symbols: Vec<String> = flex_params.iter().map(|fp| fp.value_param.clone()).collect();
+    let mut tickers = ticker_hub.get(&page_symbols);
+    let missing: Vec<String> =
+        page_symbols.into_iter().filter(|s| !tickers.contains_key(s)).collect();
+    if !missing.is_empty() {
+        for (symbol, t) in fetch_page_tickers(&missing).await.unwrap_or_default() {
+            let ticker = MarketTicker {
+                symbol: symbol.clone(),
+                last_price: t.last_price,
+                price_change_percent: t.price_change_percent,
+            };
+            tickers.insert(symbol, ticker);
+        }
+    }
+
+    let still_missing: Vec<String> = flex_params
+        .iter()
+        .map(|fp| fp.value_param.clone())
+        .filter(|s| !tickers.contains_key(s))
+        .collect();
+    let fallback = fallback_prices_from_candles(pool, &still_missing).await;
 
     let mut symbols = Vec::with_capacity(flex_params.len());
     for fp in flex_params {
         let (last_price, price_change_percent) = match tickers.get(&fp.value_param) {
             Some(t) => (t.last_price.clone(), t.price_change_percent.clone()),
-            None => match fallback_price_from_candles(pool, &fp.value_param).await {
-                Some(price) => price,
-                None => ("0".to_string(), "0".to_string()),
-            },
+            None => fallback
+                .get(&fp.value_param)
+                .cloned()
+                .unwrap_or_else(|| ("0".to_string(), "0".to_string())),
         };
 
         symbols.push(MarketSymbol {

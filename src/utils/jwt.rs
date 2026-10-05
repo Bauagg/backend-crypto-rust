@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
@@ -26,12 +28,48 @@ pub struct TokenPair {
     pub refresh_token: String,
 }
 
-fn secret() -> String {
-    std::env::var("JWT_SECRET").expect("JWT_SECRET tidak ditemukan di .env")
+/// Kunci & masa berlaku token — dibaca dari env sekali saja (`init`), bukan tiap request.
+struct JwtKeys {
+    access_encoding: EncodingKey,
+    access_decoding: DecodingKey,
+    refresh_encoding: EncodingKey,
+    refresh_decoding: DecodingKey,
+    access_ttl: i64,
+    refresh_ttl: i64,
 }
 
-fn refresh_secret() -> String {
-    std::env::var("JWT_REFRESH_SECRET").expect("JWT_REFRESH_SECRET tidak ditemukan di .env")
+static KEYS: OnceLock<JwtKeys> = OnceLock::new();
+
+fn load_keys() -> Result<JwtKeys, AppError> {
+    let env = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| AppError::Internal(format!("{key} tidak ditemukan di .env")))
+    };
+    let secret = env("JWT_SECRET")?;
+    let refresh_secret = env("JWT_REFRESH_SECRET")?;
+    Ok(JwtKeys {
+        access_encoding: EncodingKey::from_secret(secret.as_bytes()),
+        access_decoding: DecodingKey::from_secret(secret.as_bytes()),
+        refresh_encoding: EncodingKey::from_secret(refresh_secret.as_bytes()),
+        refresh_decoding: DecodingKey::from_secret(refresh_secret.as_bytes()),
+        access_ttl: expires_in_seconds("JWT_EXPIRES_IN", "15m"),
+        refresh_ttl: expires_in_seconds("JWT_REFRESH_EXPIRES_IN", "7d"),
+    })
+}
+
+/// Baca kunci JWT saat server start — env kosong = server gagal start, bukan error saat request.
+pub fn init() -> Result<(), AppError> {
+    keys().map(|_| ())
+}
+
+fn keys() -> Result<&'static JwtKeys, AppError> {
+    if let Some(keys) = KEYS.get() {
+        return Ok(keys);
+    }
+    let keys = load_keys()?;
+    Ok(KEYS.get_or_init(|| keys))
 }
 
 fn expires_in_seconds(env_key: &str, default: &str) -> i64 {
@@ -66,43 +104,27 @@ fn build_claims(payload: &JwtPayload, ttl_seconds: i64) -> JwtClaims {
 }
 
 pub fn sign_token(payload: &JwtPayload) -> Result<String, AppError> {
-    let ttl = expires_in_seconds("JWT_EXPIRES_IN", "15m");
-    let claims = build_claims(payload, ttl);
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret().as_bytes()),
-    )
-    .map_err(|_| AppError::Internal("Gagal membuat token".to_string()))
+    let keys = keys()?;
+    let claims = build_claims(payload, keys.access_ttl);
+    encode(&Header::default(), &claims, &keys.access_encoding)
+        .map_err(|_| AppError::Internal("Gagal membuat token".to_string()))
 }
 
 pub fn verify_token(token: &str) -> Result<JwtClaims, AppError> {
-    decode::<JwtClaims>(
-        token,
-        &DecodingKey::from_secret(secret().as_bytes()),
-        &Validation::default(),
-    )
-    .map(|data| data.claims)
-    .map_err(|_| AppError::Unauthorized("Token tidak valid".to_string()))
+    decode::<JwtClaims>(token, &keys()?.access_decoding, &Validation::default())
+        .map(|data| data.claims)
+        .map_err(|_| AppError::Unauthorized("Token tidak valid".to_string()))
 }
 
 pub fn sign_refresh_token(payload: &JwtPayload) -> Result<String, AppError> {
-    let ttl = expires_in_seconds("JWT_REFRESH_EXPIRES_IN", "7d");
-    let claims = build_claims(payload, ttl);
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(refresh_secret().as_bytes()),
-    )
-    .map_err(|_| AppError::Internal("Gagal membuat refresh token".to_string()))
+    let keys = keys()?;
+    let claims = build_claims(payload, keys.refresh_ttl);
+    encode(&Header::default(), &claims, &keys.refresh_encoding)
+        .map_err(|_| AppError::Internal("Gagal membuat refresh token".to_string()))
 }
 
 pub fn verify_refresh_token(token: &str) -> Result<JwtClaims, AppError> {
-    decode::<JwtClaims>(
-        token,
-        &DecodingKey::from_secret(refresh_secret().as_bytes()),
-        &Validation::default(),
-    )
+    decode::<JwtClaims>(token, &keys()?.refresh_decoding, &Validation::default())
     .map(|data| data.claims)
     .map_err(|_| AppError::Unauthorized("Refresh token tidak valid".to_string()))
 }
