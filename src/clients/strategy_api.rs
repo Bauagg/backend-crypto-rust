@@ -6,10 +6,23 @@
 use serde_json::Value;
 
 use crate::utils::app_error::AppError;
-use crate::utils::http_client::{get_json_with_error_body, post_json_with_error_body, ErrorResponse};
+use crate::utils::http_client::{
+    get_json_with_error_body, post_json_with_error_body, ErrorResponse, Headers,
+};
 
 fn api_base_url() -> String {
     std::env::var("STRATEGY_API_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
+}
+
+/// Header `X-API-Key` untuk setiap request ke API Python (`STRATEGY_API_KEY` di env). Kosong =
+/// tanpa header (API Python lokal yang belum memakai key).
+fn auth_headers() -> Headers {
+    std::env::var("STRATEGY_API_KEY")
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .map(|key| vec![("X-API-Key", key)])
+        .unwrap_or_default()
 }
 
 /// Error dari Python selalu `{"detail": ...}` — `detail` berupa string, atau list objek validasi
@@ -21,6 +34,12 @@ fn to_app_error(error: ErrorResponse) -> AppError {
         .and_then(|body| body.get("detail")?.as_str().map(str::to_string));
 
     match (error.status, detail) {
+        // Key salah/kosong = konfigurasi server (STRATEGY_API_KEY), bukan kesalahan user — jangan
+        // diteruskan ke FE, cukup di-log.
+        (401 | 403, _) => {
+            tracing::error!("API strategi menolak API key ({}): {} — cek STRATEGY_API_KEY", error.status, error.body);
+            AppError::Internal("Layanan rekomendasi sedang bermasalah".to_string())
+        }
         (404, Some(detail)) => AppError::NotFound(detail),
         (400..=499, Some(detail)) => AppError::BadRequest(detail),
         (400..=499, None) => AppError::BadRequest("Parameter rekomendasi tidak valid".to_string()),
@@ -42,7 +61,7 @@ pub async fn get_momentum_recommendations(limit: u8, date: Option<&str>) -> Resu
         url.push_str(&format!("&date={date}"));
     }
 
-    match get_json_with_error_body(&url).await {
+    match get_json_with_error_body(&url, auth_headers()).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(to_app_error(error)),
         Err(_) => Err(AppError::Internal(
@@ -103,7 +122,7 @@ pub struct SignalResponse {
 /// `POST /signal` — sinyal harian bot trading untuk 1 akun.
 pub async fn post_signal(body: &SignalRequest) -> Result<SignalResponse, AppError> {
     let url = format!("{}/signal", api_base_url().trim_end_matches('/'));
-    match post_json_with_error_body(&url, body).await {
+    match post_json_with_error_body(&url, auth_headers(), body).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => Err(to_app_error(error)),
         Err(_) => Err(AppError::Internal(

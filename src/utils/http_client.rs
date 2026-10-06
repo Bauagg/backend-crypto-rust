@@ -96,8 +96,13 @@ pub struct ErrorResponse {
 /// error-nya memang ditujukan untuk user. Jangan dipakai untuk API pihak ketiga.
 pub async fn get_json_with_error_body<T: DeserializeOwned>(
     url: &str,
+    headers: Headers,
 ) -> Result<Result<T, ErrorResponse>, AppError> {
-    let response = client().get(url).timeout(DEFAULT_TIMEOUT).send().await.map_err(|err| {
+    let mut request = client().get(url).timeout(DEFAULT_TIMEOUT);
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.map_err(|err| {
         tracing::error!("Gagal menghubungi {url}: {err}");
         AppError::Internal("Gagal menghubungi layanan eksternal".to_string())
     })?;
@@ -122,12 +127,14 @@ pub async fn get_json_with_error_body<T: DeserializeOwned>(
 /// Batas waktu 60 detik: perhitungan sinyal di Python bisa butuh beberapa detik per akun.
 pub async fn post_json_with_error_body<T: DeserializeOwned>(
     url: &str,
+    headers: Headers,
     body: &(impl Serialize + ?Sized),
 ) -> Result<Result<T, ErrorResponse>, AppError> {
-    let response = client()
-        .post(url)
-        .timeout(Duration::from_secs(60))
-        .json(body)
+    let mut request = client().post(url).timeout(Duration::from_secs(60)).json(body);
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    let response = request
         .send()
         .await
         .map_err(|err| {
