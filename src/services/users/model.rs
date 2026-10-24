@@ -45,3 +45,17 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// 1 permintaan lupa password (tabel `password_resets`). Kode OTP & reset token hanya disimpan
+/// sebagai hash SHA-256. Kolom token & `used_at` cukup dicek di query (repository), jadi tidak
+/// perlu dibaca ke struct.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PasswordReset {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub otp_hash: String,
+    pub otp_expires_at: DateTime<Utc>,
+    pub attempts: i32,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}

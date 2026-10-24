@@ -38,3 +38,10 @@ pub struct UpdateFlexParamInput {
     pub header_id: Option<Uuid>,
     pub is_active: Option<bool>,
 }
+
+/// Cakupan data list: semua, atau dikunci ke 1 `type_param` / 1 `header_id` dari path URL.
+pub enum FlexParamScope<'a> {
+    All,
+    Type(&'a str),
+    Header(Uuid),
+}

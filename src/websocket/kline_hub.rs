@@ -14,8 +14,8 @@ use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
-use super::repository;
-use super::types::Candle;
+use crate::services::market::repository;
+use crate::services::market::types::Candle;
 use crate::clients::binance;
 use crate::database::RedisPool;
 

@@ -12,13 +12,14 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::model::TradePosition;
-use super::repository::{create_trade_positions_bulk, find_open_trade_positions};
-use super::robot_common::{
-    buy_retry_factor, close_positions_fifo, floor_to_step, min_account_value, to_decimal, to_f64,
+use crate::database::{begin, commit};
+use crate::services::transactions::model::TradePosition;
+use crate::services::transactions::repository::{create_trade_positions_bulk, find_open_trade_positions};
+use super::common::{
+    buy_retry_factor, close_positions_fifo, fee_rate, floor_to_step, min_account_value, to_decimal, to_f64,
     SellFill, SOURCE, SYMBOL_TYPE_PARAM, SYSTEM_ACTOR, USDT_IDR_SYMBOL,
 };
-use super::types::NewTradePosition;
+use crate::services::transactions::types::NewTradePosition;
 use crate::clients::binance::{self, TradingRules};
 use crate::clients::strategy_api::{self, SignalOrder, SignalRequest};
 use crate::services::flex_params::repository::find_flex_params_by_type;
@@ -27,11 +28,6 @@ use crate::services::users::repository::{find_demo_robot_users, update_demo_robo
 use crate::utils::app_error::AppError;
 
 const ACCOUNT_MODE: &str = "DEMO";
-
-/// Fee spot Binance standar 0,1% per transaksi.
-fn fee_rate() -> Decimal {
-    Decimal::new(1, 3)
-}
 
 /// Ringkasan 1 putaran robot demo, untuk log.
 #[derive(Debug, Default)]
@@ -63,12 +59,9 @@ pub async fn run_demo_robot(pool: &PgPool) -> Result<DemoRobotRun, AppError> {
     let yesterday = today - Duration::days(1);
 
     let users: Vec<User> = {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+        let mut tx = begin(pool).await?;
         let users = find_demo_robot_users(&mut tx).await?;
-        let _ = tx.commit().await;
+        commit(tx).await?;
         users
             .into_iter()
             .filter(|u| u.demo_robot_last_run_date != Some(today))
@@ -129,10 +122,7 @@ async fn process_user(
     today: NaiveDate,
     yesterday: NaiveDate,
 ) -> Result<UserOutcome, AppError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+    let mut tx = begin(pool).await?;
 
     let mut positions = find_open_trade_positions(&mut tx, user.id, ACCOUNT_MODE, SOURCE).await?;
     let mut cash = user.demo_balance;
@@ -145,7 +135,7 @@ async fn process_user(
     // Saldo tidak cukup untuk membuat order apa pun -> lewati & matikan robot.
     if total_value < min_account_value() {
         update_demo_robot_state(&mut tx, user.id, cash, user.demo_initial_capital, today, false).await?;
-        tx.commit().await.map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))?;
+        commit(tx).await?;
         return Ok(UserOutcome::LowBalance);
     }
 
@@ -241,7 +231,7 @@ async fn process_user(
         !kill_switch,
     )
     .await?;
-    tx.commit().await.map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))?;
+    commit(tx).await?;
 
     Ok(if kill_switch {
         UserOutcome::KillSwitch { opened, closed }
@@ -276,8 +266,8 @@ fn simulate_buy(
 
     let quantity = floor_to_step(spend / price, rule.step_size);
     let cost = quantity * price;
-    if quantity.is_zero() || cost < rule.min_notional {
-        tracing::warn!("Robot demo {}: BUY {} di bawah minimum order, dilewati", user.email, order.symbol);
+    if let Some(violation) = rule.market_violation(quantity, cost) {
+        tracing::warn!("Robot demo {}: BUY {} melanggar aturan Binance ({violation:?}), dilewati", user.email, order.symbol);
         return None;
     }
 
@@ -346,8 +336,8 @@ async fn simulate_sell(
         floor_to_step(to_decimal(order.nilai_usdt) / price, rule.step_size).min(held)
     };
     let proceeds = sell_quantity * price;
-    if sell_quantity.is_zero() || proceeds < rule.min_notional {
-        tracing::warn!("SELL {} di bawah minimum order, dilewati", order.symbol);
+    if let Some(violation) = rule.market_violation(sell_quantity, proceeds) {
+        tracing::warn!("SELL {} melanggar aturan Binance ({violation:?}), dilewati", order.symbol);
         return Ok(0);
     }
 
@@ -412,7 +402,7 @@ mod tests {
     fn buy_seperti_binance_qty_dibulatkan_fee_dari_coin() {
         let user = demo_user("1000", "IDR");
         let mut cash = d("1000");
-        let rule = TradingRules { step_size: d("0.00001"), min_notional: d("5") };
+        let rule = TradingRules { step_size: d("0.00001"), min_qty: d("0.00001"), max_qty: Some(d("9000")), min_notional: d("5"), max_notional: None };
         let row = simulate_buy(&user, &buy_order("BTCUSDT", 50.0), d("86150"), rule, Utc::now(),
             uuid::Uuid::new_v4(), "V23", d("17889"), d("1000"), &mut cash).unwrap();
 
@@ -429,7 +419,7 @@ mod tests {
     #[test]
     fn buy_saldo_kurang_coba_99_persen_lalu_skip() {
         let user = demo_user("49.6", "USDT");
-        let rule = TradingRules { step_size: d("0.00001"), min_notional: d("5") };
+        let rule = TradingRules { step_size: d("0.00001"), min_qty: d("0.00001"), max_qty: Some(d("9000")), min_notional: d("5"), max_notional: None };
         // 50 > 49.6 -> dicoba 49.5 (×0,99) -> cukup
         let mut cash = d("49.6");
         assert!(simulate_buy(&user, &buy_order("BTCUSDT", 50.0), d("86150"), rule, Utc::now(),
@@ -445,7 +435,7 @@ mod tests {
     fn buy_di_bawah_minimum_notional_skip() {
         let user = demo_user("1000", "USDT");
         let mut cash = d("1000");
-        let rule = TradingRules { step_size: d("0.00001"), min_notional: d("5") };
+        let rule = TradingRules { step_size: d("0.00001"), min_qty: d("0.00001"), max_qty: Some(d("9000")), min_notional: d("5"), max_notional: None };
         assert!(simulate_buy(&user, &buy_order("BTCUSDT", 4.0), d("86150"), rule, Utc::now(),
             uuid::Uuid::new_v4(), "V23", d("17889"), d("1000"), &mut cash).is_none());
         assert_eq!(cash, d("1000"));

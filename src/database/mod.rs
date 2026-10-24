@@ -1,9 +1,29 @@
 use deadpool_redis::{Config as RedisConfig, Runtime};
 use sqlx::postgres::{PgPoolOptions, PgPool};
+use sqlx::{Postgres, Transaction};
+
+use crate::utils::app_error::AppError;
 
 /// Alias supaya modul lain yang butuh pool Redis (lewat `Extension<RedisPool>`) tidak perlu
 /// import `deadpool_redis` langsung.
 pub type RedisPool = deadpool_redis::Pool;
+
+/// Transaksi DB Postgres yang dipinjamkan service ke repository.
+pub type Tx<'a> = Transaction<'a, Postgres>;
+
+/// Mulai transaksi DB. Dipanggil di service (bukan controller); transaksi yang tidak di-`commit`
+/// (mis. keluar lebih awal lewat `?`) otomatis di-rollback saat di-drop.
+pub async fn begin(pool: &PgPool) -> Result<Tx<'_>, AppError> {
+    pool.begin()
+        .await
+        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
+}
+
+pub async fn commit(tx: Tx<'_>) -> Result<(), AppError> {
+    tx.commit()
+        .await
+        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
+}
 
 pub async fn connect() -> PgPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL tidak ditemukan di .env");

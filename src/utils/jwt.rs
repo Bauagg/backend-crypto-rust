@@ -14,6 +14,14 @@ pub struct JwtClaims {
     pub exp: usize,
 }
 
+impl JwtClaims {
+    /// `user_id` token sebagai UUID — token dengan id rusak dianggap tidak valid (401).
+    pub fn user_uuid(&self) -> Result<uuid::Uuid, AppError> {
+        uuid::Uuid::parse_str(&self.user_id)
+            .map_err(|_| AppError::Unauthorized("Token tidak valid".to_string()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JwtPayload {
     pub user_id: String,

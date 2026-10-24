@@ -6,31 +6,14 @@ use axum::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::repository::FlexParamScope;
 use super::service::{
     create_flex_param_service, delete_flex_param_service, get_flex_param_by_id_service,
     get_flex_params_list_service, update_flex_param_service, PhotoUpload,
 };
-use super::types::{CreateFlexParamInput, ListQueryOptions, UpdateFlexParamInput};
+use super::types::{CreateFlexParamInput, FlexParamScope, ListQueryOptions, UpdateFlexParamInput};
 use crate::utils::api_response::{created, paginated, success, PaginationParams};
 use crate::utils::app_error::AppError;
 use crate::utils::jwt::JwtClaims;
-
-fn parse_user_id(claims: &JwtClaims) -> Result<Uuid, AppError> {
-    Uuid::parse_str(&claims.user_id).map_err(|_| AppError::Unauthorized("Token tidak valid".to_string()))
-}
-
-async fn begin_tx(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
-}
-
-async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
-}
 
 fn non_empty(value: String) -> Option<String> {
     if value.is_empty() {
@@ -117,7 +100,7 @@ pub async fn create_flex_param(
     Extension(claims): Extension<JwtClaims>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
-    let user_id = parse_user_id(&claims)?;
+    let user_id = claims.user_uuid()?;
     let fields = parse_multipart(multipart).await?;
 
     let is_active = fields
@@ -133,18 +116,7 @@ pub async fn create_flex_param(
     };
     let photo = fields.photo;
 
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match create_flex_param_service(&mut tx, input, user_id, &claims.email, photo).await
-    {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let result = create_flex_param_service(&pool, input, user_id, &claims.email, photo).await?;
     Ok(created(result, "Flex param berhasil dibuat"))
 }
 
@@ -159,18 +131,7 @@ async fn list_flex_params(
     let pagination = PaginationParams::parse(query.page, query.limit);
     let offset = (pagination.page - 1) * pagination.limit;
 
-    let mut tx = begin_tx(pool).await?;
-
-    let (params, total) =
-        match get_flex_params_list_service(&mut tx, scope, &query, pagination.limit, offset).await {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
-        };
-
-    commit_tx(tx).await?;
+    let (params, total) = get_flex_params_list_service(pool, scope, &query, pagination.limit, offset).await?;
     Ok(paginated(params, total, &pagination, message))
 }
 
@@ -185,17 +146,7 @@ pub async fn get_flex_param_by_id(
     State(pool): State<PgPool>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match get_flex_param_by_id_service(&mut tx, id).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let result = get_flex_param_by_id_service(&pool, id).await?;
     Ok(success(result, "Berhasil mengambil flex param"))
 }
 
@@ -243,17 +194,7 @@ pub async fn update_flex_param(
         is_active: fields.is_active,
     };
 
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match update_flex_param_service(&mut tx, id, input, &claims.email, fields.photo).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let result = update_flex_param_service(&pool, id, input, &claims.email, fields.photo).await?;
     Ok(success(result, "Flex param berhasil diupdate"))
 }
 
@@ -262,13 +203,6 @@ pub async fn delete_flex_param(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    if let Err(err) = delete_flex_param_service(&mut tx, id, &claims.email).await {
-        let _ = tx.rollback().await;
-        return Err(err);
-    }
-
-    commit_tx(tx).await?;
+    delete_flex_param_service(&pool, id, &claims.email).await?;
     Ok(success(serde_json::Value::Null, "Flex param berhasil dihapus"))
 }

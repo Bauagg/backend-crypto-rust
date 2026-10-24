@@ -3,21 +3,26 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Body `POST /api/transactions` — hanya yang memang keputusan user. Sisanya diisi sistem:
-/// user & email dari token, simbol dari `flex_params`, harga masuk & kurs USDT/IDR dari Binance,
-/// modal akun dari `demo_balance` (DEMO) atau saldo Binance user (LIVE), waktu buka = sekarang,
-/// status `OPEN`.
+/// Body `POST /api/transactions` — BUY & SELL manual, body sama. Hanya yang memang keputusan user;
+/// sisanya diisi sistem: user & email dari token, simbol dari `flex_params`, harga & kurs USDT/IDR
+/// dari Binance, modal akun dari `demo_balance` (DEMO) atau saldo Binance user (LIVE).
+/// - BUY: buka posisi baru senilai `amount` (maksimal modal akun).
+/// - SELL: jual coin senilai `amount` — posisi dipilih sistem FIFO (terlama dulu, manual maupun
+///   robot), maksimal sebanyak yang dimiliki.
 #[derive(Debug, Deserialize)]
-pub struct CreateTradePositionInput {
-    /// Coin yang dibeli (`flex_params` SIMBOL_CRYPTO).
+pub struct TradeInput {
+    /// `BUY` | `SELL`
+    pub transaction_type: String,
+    /// Coin yang dibeli/dijual (`flex_params` SIMBOL_CRYPTO).
     pub flex_param_id: Uuid,
-    /// Nilai yang dipakai untuk posisi ini, dalam `currency` (> 0). Kalau `IDR`, sistem
-    /// mengonversinya ke USDT pakai kurs Binance saat itu; hasil USDT tidak boleh melebihi modal akun.
-    pub entry_value: Decimal,
-    /// Mata uang `entry_value`: `IDR` | `USDT`. Opsional — kosong = `preferred_currency` user.
-    pub currency: Option<String>,
     /// `DEMO` | `LIVE`
     pub account_mode: String,
+    /// Nilai yang dibeli/dijual dalam `currency` (> 0), mis. "30" = senilai $30. Kalau `IDR`,
+    /// dikonversi ke USDT pakai kurs Binance saat itu.
+    pub amount: Decimal,
+    /// Mata uang `amount`: `IDR` | `USDT`. Opsional — kosong = `preferred_currency` user.
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 /// Query param list posisi: search simbol, filter & sort dinamis (format sama dengan flex_params),
@@ -216,4 +221,92 @@ pub struct AllocationItem {
     pub photo_url: Option<String>,
     pub value: Decimal,
     pub percent: Decimal,
+}
+
+
+/// Hasil jual manual.
+#[derive(Debug, Serialize)]
+pub struct ManualSellResult {
+    pub symbol: String,
+    pub account_mode: String,
+    pub sold_quantity: Decimal,
+    /// Harga jual rata-rata.
+    pub exit_price: Decimal,
+    /// USDT bersih diterima (sudah dipotong fee jual).
+    pub exit_value: Decimal,
+    pub fee_amount: Decimal,
+    pub pnl_amount: Decimal,
+    pub pnl_percent: Decimal,
+    /// `PROFIT` | `LOSS`
+    pub result: String,
+    /// Jumlah posisi yang ikut terjual (FIFO).
+    pub positions_sold: usize,
+    /// Sisa coin ini yang masih dipegang (0 = habis).
+    pub remaining_quantity: Decimal,
+    /// orderId Binance (LIVE); `None` untuk DEMO.
+    pub order_id: Option<String>,
+}
+
+/// Query `GET /api/transactions/holding?flex_param_id=&account_mode=`.
+#[derive(Debug, Deserialize)]
+pub struct HoldingQuery {
+    pub flex_param_id: Uuid,
+    /// `DEMO` (default) | `LIVE`
+    #[serde(default)]
+    pub account_mode: Option<String>,
+}
+
+/// Total 1 coin yang dimiliki user (posisi OPEN manual + robot) — untuk layar Sell ("Dimiliki: …").
+#[derive(Debug, Serialize)]
+pub struct Holding {
+    pub flex_param_id: Uuid,
+    pub symbol: String,
+    pub photo_url: Option<String>,
+    pub account_mode: String,
+    /// Total coin yang dimiliki = batas maksimal yang bisa dijual.
+    pub quantity: Decimal,
+    /// Bagian dari `quantity` hasil beli manual.
+    pub manual_quantity: Decimal,
+    /// Bagian dari `quantity` hasil robot.
+    pub bot_quantity: Decimal,
+    /// Total USDT yang dulu dipakai membeli.
+    pub entry_value: Decimal,
+    pub avg_entry_price: Decimal,
+    pub current_price: Decimal,
+    /// Nilai sekarang (`quantity × current_price`) — maksimal `amount` yang bisa dijual.
+    pub current_value: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub unrealized_pnl_percent: Decimal,
+    /// Jumlah posisi OPEN yang membentuk total ini.
+    pub open_positions: usize,
+    /// Saldo USDT yang tidak sedang dipakai di transaksi — maksimal `amount` untuk BUY.
+    /// DEMO: `demo_balance`; LIVE: USDT bebas di Binance (`null` kalau API key belum diisi).
+    pub available_balance: Option<Decimal>,
+    /// Rincian posisi OPEN, terlama dulu (urutan yang dijual duluan saat SELL).
+    pub positions: Vec<HoldingPosition>,
+}
+
+/// 1 posisi OPEN di dalam `Holding`, dinilai dengan harga sekarang.
+#[derive(Debug, Serialize)]
+pub struct HoldingPosition {
+    pub id: Uuid,
+    /// `MANUAL` | `BOT`
+    pub source: String,
+    pub strategy: Option<String>,
+    pub opened_at: DateTime<Utc>,
+    pub holding_days: i64,
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+    pub entry_value: Decimal,
+    pub current_value: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub unrealized_pnl_percent: Decimal,
+}
+
+/// Query `GET /api/transactions/holding/:symbol?account_mode=`.
+#[derive(Debug, Deserialize)]
+pub struct HoldingBySymbolQuery {
+    /// `DEMO` (default) | `LIVE`
+    #[serde(default)]
+    pub account_mode: Option<String>,
 }
