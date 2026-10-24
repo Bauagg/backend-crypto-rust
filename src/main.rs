@@ -1,10 +1,15 @@
 mod clients;
 mod config;
 mod database;
+mod indicator;
 mod middlewares;
+mod robot;
 mod router;
 mod services;
+mod template;
 mod utils;
+mod websocket;
+mod worker;
 
 use axum::{routing::get, Extension, Json, Router};
 use serde_json::json;
@@ -21,19 +26,17 @@ async fn main() {
 
     let pool = database::connect().await;
     let redis_pool = database::connect_redis().await;
-    let kline_hub = services::market::stream_hub::KlineHub::new(redis_pool.clone());
-    let ticker_hub = services::market::ticker_hub::TickerHub::new();
 
     // Akun System (pemilik data buatan server) harus ada sebelum worker sync jalan.
     if let Err(err) = services::users::service::ensure_system_user(&pool).await {
         tracing::error!("Gagal menyiapkan akun System: {err:?}");
     }
 
-    // Background worker: jalan terus selama server hidup, tidak menunda server siap menerima request.
-    tokio::spawn(start_market_workers(pool.clone()));
-    tokio::spawn(ticker_hub.clone().run(pool.clone()));
-    tokio::spawn(services::fear_greed::worker::start(pool.clone()));
-    tokio::spawn(services::transactions::worker::start(pool.clone()));
+    // Background worker (daftar & jadwalnya di `worker/mod.rs`) — tidak menunda server siap
+    // menerima request.
+    worker::start_workers(pool.clone());
+    // WebSocket real-time (hub chart & harga live; detailnya di `websocket/mod.rs`).
+    let hubs = websocket::start(pool.clone(), redis_pool.clone());
 
     let upload_folder = std::env::var("PATH_FILE_UPLOAD").unwrap_or_else(|_| "files".to_string());
     let upload_folder = upload_folder.trim().to_string();
@@ -43,9 +46,9 @@ async fn main() {
         .nest_service(&format!("/{upload_folder}"), ServeDir::new(&upload_folder))
         .nest("/api", router::router())
         .with_state(pool)
-        .layer(Extension(redis_pool))
-        .layer(Extension(kline_hub))
-        .layer(Extension(ticker_hub))
+        .layer(Extension(redis_pool));
+    let app = hubs
+        .layer(app)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -56,12 +59,4 @@ async fn main() {
 
     tracing::info!("Server running on http://localhost:{port}");
     axum::serve(listener, app).await.expect("Server error");
-}
-
-/// Daftar coin disinkronkan dulu sebelum worker candle jalan — supaya coin baru hasil sync
-/// langsung ikut dikumpulkan candle-nya di putaran pertama, bukan menunggu 30 menit.
-async fn start_market_workers(pool: sqlx::PgPool) {
-    services::coin_symbols::worker::sync_once(&pool).await;
-    tokio::spawn(services::candle_ohlcv::worker::start(pool.clone()));
-    services::coin_symbols::worker::start(pool).await;
 }

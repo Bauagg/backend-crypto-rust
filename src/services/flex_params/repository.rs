@@ -2,6 +2,7 @@ use sqlx::{Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
 
 use super::model::FlexParam;
+use super::types::FlexParamScope;
 use crate::utils::app_error::AppError;
 use crate::utils::query_filter::{
     push_filters, push_order_by, FilterColumn, FilterCondition, SortCondition,
@@ -186,13 +187,6 @@ pub async fn restore_flex_param(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-/// Cakupan data list: semua, atau dikunci ke 1 `type_param` / 1 `header_id` dari path URL.
-pub enum FlexParamScope<'a> {
-    All,
-    Type(&'a str),
-    Header(Uuid),
 }
 
 /// `WHERE` dasar (belum dihapus + cakupan) lalu filter dinamis dari user.

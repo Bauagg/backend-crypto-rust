@@ -133,12 +133,48 @@ pub async fn get_spot_symbols() -> Result<Vec<ExchangeSymbol>, AppError> {
     Ok(info.symbols)
 }
 
-/// Aturan order 1 pair dari `exchangeInfo`: kelipatan qty (`LOT_SIZE.stepSize`) & nilai order
-/// minimum dalam USDT (`NOTIONAL`/`MIN_NOTIONAL`).
+/// Aturan order MARKET 1 pair dari `exchangeInfo`, persis filter Binance:
+/// - qty: kelipatan `LOT_SIZE.stepSize`, batas `minQty`/`maxQty` dari `LOT_SIZE` & `MARKET_LOT_SIZE`
+///   (keduanya berlaku untuk order MARKET — diambil yang paling ketat);
+/// - nilai order (USDT): `NOTIONAL.minNotional` bila `applyMinToMarket`, `maxNotional` bila
+///   `applyMaxToMarket` (pair lama: `MIN_NOTIONAL` + `applyToMarket`). Tidak berlaku = 0 / `None`.
 #[derive(Debug, Clone, Copy)]
 pub struct TradingRules {
     pub step_size: Decimal,
+    pub min_qty: Decimal,
+    pub max_qty: Option<Decimal>,
     pub min_notional: Decimal,
+    pub max_notional: Option<Decimal>,
+}
+
+/// Filter Binance yang dilanggar sebuah order MARKET.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleViolation {
+    /// Qty 0 setelah dibulatkan ke `stepSize`, atau di bawah `minQty`.
+    MinQty(Decimal),
+    MaxQty(Decimal),
+    MinNotional(Decimal),
+    MaxNotional(Decimal),
+}
+
+impl TradingRules {
+    /// Cek order MARKET seperti Binance: `quantity` (sudah dibulatkan ke `stepSize`) & nilainya
+    /// dalam USDT. `None` = lolos semua filter.
+    pub fn market_violation(&self, quantity: Decimal, notional: Decimal) -> Option<RuleViolation> {
+        if quantity.is_zero() || quantity < self.min_qty {
+            return Some(RuleViolation::MinQty(self.min_qty.max(self.step_size)));
+        }
+        if let Some(max) = self.max_qty.filter(|max| quantity > *max) {
+            return Some(RuleViolation::MaxQty(max));
+        }
+        if notional < self.min_notional {
+            return Some(RuleViolation::MinNotional(self.min_notional));
+        }
+        if let Some(max) = self.max_notional.filter(|max| notional > *max) {
+            return Some(RuleViolation::MaxNotional(max));
+        }
+        None
+    }
 }
 
 /// Aturan order beberapa pair sekaligus (`GET /api/v3/exchangeInfo?symbols=[...]`, respons kecil).
@@ -165,24 +201,102 @@ async fn trading_rules_at(
     let url = format!("{base_url}/api/v3/exchangeInfo?symbols={list}");
     let info: Value = get_json(&url).await?;
 
-    let decimal = |filter: &Value, key: &str| -> Option<Decimal> {
-        filter.get(key)?.as_str()?.parse().ok()
-    };
     let mut rules = HashMap::new();
     for symbol in info["symbols"].as_array().into_iter().flatten() {
         let Some(name) = symbol["symbol"].as_str() else { continue };
         let filters = symbol["filters"].as_array().cloned().unwrap_or_default();
-        let find = |kind: &str| filters.iter().find(|f| f["filterType"] == kind).cloned();
-
-        let step_size = find("LOT_SIZE").and_then(|f| decimal(&f, "stepSize"));
-        let min_notional = find("NOTIONAL")
-            .and_then(|f| decimal(&f, "minNotional"))
-            .or_else(|| find("MIN_NOTIONAL").and_then(|f| decimal(&f, "minNotional")));
-        if let (Some(step_size), Some(min_notional)) = (step_size, min_notional) {
-            rules.insert(name.to_string(), TradingRules { step_size, min_notional });
+        if let Some(rule) = parse_trading_rules(&filters) {
+            rules.insert(name.to_string(), rule);
         }
     }
     Ok(rules)
+}
+
+/// `filters` 1 simbol dari `exchangeInfo` -> `TradingRules`. `None` kalau `LOT_SIZE` tidak ada.
+fn parse_trading_rules(filters: &[Value]) -> Option<TradingRules> {
+    let find = |kind: &str| filters.iter().find(|f| f["filterType"] == kind);
+    let decimal = |filter: Option<&Value>, key: &str| -> Option<Decimal> {
+        filter?.get(key)?.as_str()?.parse().ok()
+    };
+    // Nilai 0 di Binance = tidak dibatasi.
+    let positive = |value: Option<Decimal>| value.filter(|v| !v.is_zero());
+
+    let lot = find("LOT_SIZE");
+    let market_lot = find("MARKET_LOT_SIZE");
+    let step_size = decimal(lot, "stepSize")?;
+    let min_qty = decimal(lot, "minQty")
+        .unwrap_or_default()
+        .max(decimal(market_lot, "minQty").unwrap_or_default());
+    let max_qty = match (positive(decimal(lot, "maxQty")), positive(decimal(market_lot, "maxQty"))) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+
+    let (min_notional, max_notional) = if let Some(notional) = find("NOTIONAL") {
+        let applies = |key: &str| notional[key].as_bool().unwrap_or(true);
+        let min = decimal(Some(notional), "minNotional").filter(|_| applies("applyMinToMarket"));
+        let max = positive(decimal(Some(notional), "maxNotional")).filter(|_| applies("applyMaxToMarket"));
+        (min.unwrap_or_default(), max)
+    } else {
+        let legacy = find("MIN_NOTIONAL");
+        let applies = legacy.and_then(|f| f["applyToMarket"].as_bool()).unwrap_or(true);
+        let min = decimal(legacy, "minNotional").filter(|_| applies);
+        (min.unwrap_or_default(), None)
+    };
+
+    Some(TradingRules { step_size, min_qty, max_qty, min_notional, max_notional })
+}
+
+#[cfg(test)]
+mod trading_rules_tests {
+    use super::*;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    /// Bentuk filter asli DOGEUSDT dari exchangeInfo.
+    fn doge() -> TradingRules {
+        parse_trading_rules(&[
+            json!({"filterType": "LOT_SIZE", "minQty": "1.00000000", "maxQty": "9000000.00000000", "stepSize": "1.00000000"}),
+            json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.00000000", "maxQty": "20508301.14644351", "stepSize": "0.00000000"}),
+            json!({"filterType": "NOTIONAL", "minNotional": "1.00000000", "applyMinToMarket": true,
+                   "maxNotional": "9000000.00000000", "applyMaxToMarket": false, "avgPriceMins": 5}),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn baca_filter_binance() {
+        let rule = doge();
+        assert_eq!(rule.step_size, d("1"));
+        assert_eq!(rule.min_qty, d("1"));
+        assert_eq!(rule.max_qty, Some(d("9000000")));
+        assert_eq!(rule.min_notional, d("1"));
+        assert_eq!(rule.max_notional, None, "applyMaxToMarket=false -> tidak berlaku untuk MARKET");
+    }
+
+    #[test]
+    fn cek_order_market() {
+        let rule = doge();
+        assert_eq!(rule.market_violation(d("10"), d("2")), None);
+        assert_eq!(rule.market_violation(d("0"), d("0")), Some(RuleViolation::MinQty(d("1"))));
+        assert_eq!(rule.market_violation(d("4"), d("0.8")), Some(RuleViolation::MinNotional(d("1"))));
+        assert_eq!(rule.market_violation(d("9000001"), d("1800000")), Some(RuleViolation::MaxQty(d("9000000"))));
+    }
+
+    #[test]
+    fn min_notional_tidak_berlaku_kalau_apply_false() {
+        let rule = parse_trading_rules(&[
+            json!({"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"}),
+            json!({"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": false}),
+        ])
+        .unwrap();
+        assert_eq!(rule.min_notional, Decimal::ZERO);
+        assert_eq!(rule.market_violation(d("0.001"), d("0.1")), None);
+    }
 }
 
 /// 1 item `/api/v3/ticker/24hr`.

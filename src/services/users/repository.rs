@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use super::model::User;
+use super::model::{PasswordReset, User};
 use crate::utils::app_error::AppError;
 
 pub async fn find_user_by_email(
@@ -216,5 +216,159 @@ pub async fn reset_demo_initial_capital(
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lupa password (`password_resets`)
+// ---------------------------------------------------------------------------------------------
+
+/// Permintaan reset terbaru user yang belum selesai/dibatalkan.
+pub async fn find_latest_password_reset(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<Option<PasswordReset>, AppError> {
+    let reset = sqlx::query_as::<_, PasswordReset>(
+        r#"
+        SELECT * FROM password_resets
+        WHERE user_id = $1 AND used_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(reset)
+}
+
+/// Batalkan semua permintaan reset user yang masih terbuka (ada permintaan baru / sudah selesai).
+pub async fn close_password_resets(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE password_resets SET used_at = now() WHERE user_id = $1 AND used_at IS NULL")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn create_password_reset(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    otp_hash: &str,
+    otp_expires_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO password_resets (user_id, otp_hash, otp_expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind(otp_hash)
+    .bind(otp_expires_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn increment_password_reset_attempts(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE password_resets SET attempts = attempts + 1 WHERE id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// OTP benar -> tandai terverifikasi & simpan hash reset token.
+pub async fn mark_password_reset_verified(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    reset_token_hash: &str,
+    reset_token_expires_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE password_resets
+        SET verified_at = now(), reset_token_hash = $1, reset_token_expires_at = $2
+        WHERE id = $3
+        "#,
+    )
+    .bind(reset_token_hash)
+    .bind(reset_token_expires_at)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Permintaan reset yang sudah lolos OTP, masih berlaku, dan belum dipakai — dicari dari hash token.
+pub async fn find_password_reset_by_token(
+    tx: &mut Transaction<'_, Postgres>,
+    reset_token_hash: &str,
+) -> Result<Option<PasswordReset>, AppError> {
+    let reset = sqlx::query_as::<_, PasswordReset>(
+        r#"
+        SELECT * FROM password_resets
+        WHERE reset_token_hash = $1 AND used_at IS NULL AND verified_at IS NOT NULL
+          AND reset_token_expires_at > now()
+        "#,
+    )
+    .bind(reset_token_hash)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(reset)
+}
+
+pub async fn update_user_password(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    hashed_password: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE users SET password = $1, updated_at = now() WHERE id = $2 AND deleted_at IS NULL",
+    )
+    .bind(hashed_password)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Kurangi saldo demo — hanya kalau saldonya cukup (dicek di query yang sama, jadi 2 request
+/// bersamaan tidak bisa membuat saldo minus). `false` = saldo tidak cukup, tidak ada perubahan.
+pub async fn debit_demo_balance(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    amount: Decimal,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE users SET demo_balance = demo_balance - $1, updated_at = now()
+        WHERE id = $2 AND deleted_at IS NULL AND demo_balance >= $1
+        "#,
+    )
+    .bind(amount)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Tambah saldo demo (hasil jual posisi demo manual).
+pub async fn credit_demo_balance(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    amount: Decimal,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE users SET demo_balance = demo_balance + $1, updated_at = now() WHERE id = $2 AND deleted_at IS NULL",
+    )
+    .bind(amount)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }

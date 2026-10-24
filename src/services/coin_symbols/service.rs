@@ -1,16 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_util::stream::{self, StreamExt};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 
 use super::types::{CoinGeckoCoin, SyncSummary};
+use crate::database::{begin, commit};
 use crate::clients::{binance, coingecko};
 use crate::services::flex_params::repository::{
     find_deleted_flex_params_by_type, find_flex_params_by_type, restore_flex_param,
     soft_delete_flex_param,
 };
 use crate::services::flex_params::service::{
-    create_flex_param_service, update_flex_param_service, PhotoUpload,
+    create_flex_param_in_tx, update_flex_param_in_tx, PhotoUpload,
 };
 use crate::services::flex_params::types::{CreateFlexParamInput, UpdateFlexParamInput};
 use crate::services::users::service::system_user_id;
@@ -152,7 +153,7 @@ async fn download_logo(symbol: &str, image_url: Option<&str>) -> Option<PhotoUpl
 /// - sudah ada, volume < `MIN_VOLUME_TO_STAY` (atau bukan crypto asli lagi) -> soft delete oleh
 ///   `system` (foto tidak dihapus);
 /// - pernah di-soft-delete oleh `system`, volume >= `MIN_VOLUME_TO_ENTER` -> dipulihkan (foto lama kembali);
-/// - belum pernah ada, volume >= `MIN_VOLUME_TO_ENTER` -> dibuat lewat `create_flex_param_service`.
+/// - belum pernah ada, volume >= `MIN_VOLUME_TO_ENTER` -> dibuat lewat `create_flex_param_in_tx`.
 ///
 /// `LOCKED_SYMBOLS` (basket V23 bot Python) tidak pernah di-soft-delete sync, apa pun volumenya.
 ///
@@ -210,7 +211,7 @@ pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, App
         let mut tx = begin(pool).await?;
         let live = find_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM, false).await?;
         let deleted = find_deleted_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM).await?;
-        let _ = tx.commit().await;
+        commit(tx).await?;
         (live, deleted)
     };
 
@@ -301,7 +302,7 @@ pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, App
             description: new_category.map(str::to_string),
             ..Default::default()
         };
-        update_flex_param_service(tx, param.id, input, SYSTEM_ACTOR, photo).await?;
+        update_flex_param_in_tx(tx, param.id, input, SYSTEM_ACTOR, photo).await?;
     }
 
     // 3. Coin besar yang belum pernah ada sama sekali — langsung dengan logo CoinGecko.
@@ -329,7 +330,7 @@ pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, App
                 header_id: None,
                 is_active: photo.is_some(),
             };
-            create_flex_param_service(tx, input, user_id, SYSTEM_ACTOR, photo).await?;
+            create_flex_param_in_tx(tx, input, user_id, SYSTEM_ACTOR, photo).await?;
             summary.created += 1;
         }
     }
@@ -338,14 +339,3 @@ pub async fn sync_coin_symbols_service(pool: &PgPool) -> Result<SyncSummary, App
     Ok(summary)
 }
 
-async fn begin(pool: &PgPool) -> Result<Transaction<'_, Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
-}
-
-async fn commit(tx: Transaction<'_, Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
-}

@@ -1,21 +1,31 @@
 use std::sync::OnceLock;
 
-use rand::RngCore;
+use chrono::{Duration, Utc};
+use rand::{Rng, RngCore};
 use rust_decimal::Decimal;
 use serde::Serialize;
-use sqlx::{PgPool, Postgres, Transaction};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::template::OtpEmail;
 use super::model::User;
 use super::repository::{
-    create_user, find_user_by_email, find_user_by_id, find_user_by_phone,
-    reset_demo_initial_capital, reset_platform_initial_capital, update_user,
+    close_password_resets, create_password_reset, create_user, find_latest_password_reset,
+    find_password_reset_by_token, find_user_by_email, find_user_by_id, find_user_by_phone,
+    increment_password_reset_attempts, mark_password_reset_verified, reset_demo_initial_capital,
+    reset_platform_initial_capital, update_user, update_user_password,
 };
-use super::types::{is_supported_platform, LoginInput, RegisterInput, UpdateProfileInput};
+use super::types::{
+    is_supported_platform, ForgotPasswordInput, LoginInput, RegisterInput, ResetPasswordInput,
+    UpdateProfileInput, VerifyOtpInput,
+};
+use crate::utils::mailer::send_email;
 use crate::clients::binance;
-use crate::services::documents::service::{update_file_service, upload_file_service, UploadInput};
+use crate::services::documents::service::{update_file_in_tx, upload_file_in_tx, UploadInput};
 use crate::services::documents::types::FileMetaInput;
+use crate::database::{begin, commit};
 use crate::utils::app_error::AppError;
 use crate::utils::bcrypt::{hash_password, verify_password};
 use crate::utils::crypto::{decrypt, encrypt};
@@ -114,11 +124,7 @@ pub fn system_user_id() -> Option<Uuid> {
 /// Pastikan akun System ada (buat kalau belum), lalu simpan id-nya untuk `system_user_id()`.
 /// Dipanggil sekali saat server start, sebelum worker jalan.
 pub async fn ensure_system_user(pool: &PgPool) -> Result<Uuid, AppError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
-
+    let mut tx = begin(pool).await?;
     let id = match find_user_by_email(&mut tx, SYSTEM_EMAIL).await? {
         Some(user) => user.id,
         None => {
@@ -138,32 +144,29 @@ pub async fn ensure_system_user(pool: &PgPool) -> Result<Uuid, AppError> {
             user.id
         }
     };
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))?;
+    commit(tx).await?;
 
     let _ = SYSTEM_USER_ID.set(id);
     Ok(id)
 }
 
-pub async fn register_service(
-    tx: &mut Transaction<'_, Postgres>,
-    input: RegisterInput,
-) -> Result<AuthResult, AppError> {
+pub async fn register_service(pool: &PgPool, input: RegisterInput) -> Result<AuthResult, AppError> {
     input.validate()?;
 
-    if find_user_by_email(tx, &input.email).await?.is_some() {
+    let role = input.role.clone().unwrap_or_else(|| "user".to_string());
+    // Hash bcrypt (lambat, ±ratusan ms) sebelum transaksi dibuka — koneksi DB tidak ikut menunggu.
+    let hashed_password = hash_password(&input.password).await?;
+
+    let mut tx = begin(pool).await?;
+    if find_user_by_email(&mut tx, &input.email).await?.is_some() {
         return Err(AppError::Conflict("Email sudah terdaftar".to_string()));
     }
-    if find_user_by_phone(tx, &input.phone).await?.is_some() {
+    if find_user_by_phone(&mut tx, &input.phone).await?.is_some() {
         return Err(AppError::Conflict("Nomor telepon sudah terdaftar".to_string()));
     }
 
-    let role = input.role.clone().unwrap_or_else(|| "user".to_string());
-    let hashed_password = hash_password(&input.password).await?;
-
     let user = create_user(
-        tx,
+        &mut tx,
         &input.full_name,
         &input.email,
         &input.phone,
@@ -171,6 +174,7 @@ pub async fn register_service(
         &role,
     )
     .await?;
+    commit(tx).await?;
 
     let tokens = generate_token_pair(&JwtPayload {
         user_id: user.id.to_string(),
@@ -185,15 +189,14 @@ pub async fn register_service(
     })
 }
 
-pub async fn login_service(
-    tx: &mut Transaction<'_, Postgres>,
-    input: LoginInput,
-) -> Result<AuthResult, AppError> {
+pub async fn login_service(pool: &PgPool, input: LoginInput) -> Result<AuthResult, AppError> {
     input.validate()?;
 
-    let user = find_user_by_email(tx, &input.email)
+    let mut tx = begin(pool).await?;
+    let user = find_user_by_email(&mut tx, &input.email)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Email atau password salah".to_string()))?;
+    commit(tx).await?;
 
     if !verify_password(&input.password, &user.password).await {
         return Err(AppError::Unauthorized("Email atau password salah".to_string()));
@@ -212,13 +215,12 @@ pub async fn login_service(
     })
 }
 
-pub async fn get_profile_service(
-    tx: &mut Transaction<'_, Postgres>,
-    user_id: Uuid,
-) -> Result<UserProfile, AppError> {
-    let user = find_user_by_id(tx, user_id)
+pub async fn get_profile_service(pool: &PgPool, user_id: Uuid) -> Result<UserProfile, AppError> {
+    let mut tx = begin(pool).await?;
+    let user = find_user_by_id(&mut tx, user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User tidak ditemukan".to_string()))?;
+    commit(tx).await?;
     Ok(user.into())
 }
 
@@ -329,7 +331,7 @@ pub async fn update_profile_service(
 
             let file = match existing_photo_id {
                 Some(file_id) => {
-                    update_file_service(tx, file_id, Some(upload), FileMetaInput::default(), &email)
+                    update_file_in_tx(tx, file_id, Some(upload), FileMetaInput::default(), &email)
                         .await?
                 }
                 None => {
@@ -337,7 +339,7 @@ pub async fn update_profile_service(
                         ref_id: Some(user_id),
                         ref_type: Some("USER_PROFILE".to_string()),
                     };
-                    upload_file_service(tx, upload, user_id, meta, &email).await?
+                    upload_file_in_tx(tx, upload, user_id, meta, &email).await?
                 }
             };
 
@@ -376,14 +378,206 @@ pub async fn update_profile_service(
     Ok(user.into())
 }
 
-async fn begin(pool: &PgPool) -> Result<Transaction<'_, Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
+// ---------------------------------------------------------------------------------------------
+// Lupa password: email -> kode OTP 6 digit -> password baru.
+// ---------------------------------------------------------------------------------------------
+
+/// Kode OTP berlaku selama ini sejak dikirim.
+const OTP_VALID_MINUTES: i64 = 10;
+/// Jeda minimal sebelum boleh minta kode baru (cegah spam email).
+const OTP_RESEND_COOLDOWN_SECONDS: i64 = 60;
+/// Salah kode lebih dari ini -> harus minta kode baru (kode 6 digit tidak bisa ditebak beruntun).
+const OTP_MAX_ATTEMPTS: i32 = 5;
+/// Setelah OTP benar, user punya waktu segini untuk mengisi password baru.
+const RESET_TOKEN_VALID_MINUTES: i64 = 15;
+
+/// Pesan sama untuk email terdaftar maupun tidak, supaya endpoint ini tidak bisa dipakai menebak
+/// email siapa saja yang punya akun.
+pub const FORGOT_PASSWORD_MESSAGE: &str =
+    "Jika email terdaftar, kode OTP sudah dikirim. Cek inbox atau folder spam.";
+const INVALID_OTP_MESSAGE: &str = "Kode OTP salah atau sudah kedaluwarsa";
+
+fn sha256_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
-async fn commit(tx: Transaction<'_, Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
+/// Hash OTP diikat ke user, supaya kode yang sama milik user lain menghasilkan hash berbeda.
+fn hash_otp(user_id: Uuid, otp: &str) -> String {
+    sha256_hex(&format!("{user_id}:{otp}"))
+}
+
+fn generate_otp() -> String {
+    format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
+}
+
+fn generate_reset_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn normalize_email(email: &str) -> String {
+    email.trim().to_string()
+}
+
+/// Langkah 1: buat kode OTP & kirim ke email user. Email yang tidak terdaftar dijawab dengan pesan
+/// yang sama (tanpa kirim email). Permintaan baru membatalkan kode lama.
+pub async fn forgot_password_service(pool: &PgPool, input: ForgotPasswordInput) -> Result<(), AppError> {
+    input.validate()?;
+    let email = normalize_email(&input.email);
+
+    let mut tx = begin(pool).await?;
+    let Some(user) = find_user_by_email(&mut tx, &email).await? else {
+        commit(tx).await?;
+        return Ok(());
+    };
+    if user.email == SYSTEM_EMAIL {
+        commit(tx).await?;
+        return Ok(());
+    }
+
+    if let Some(latest) = find_latest_password_reset(&mut tx, user.id).await? {
+        let elapsed = (Utc::now() - latest.created_at).num_seconds();
+        if elapsed < OTP_RESEND_COOLDOWN_SECONDS {
+            return Err(AppError::BadRequest(format!(
+                "Tunggu {} detik sebelum meminta kode baru",
+                OTP_RESEND_COOLDOWN_SECONDS - elapsed
+            )));
+        }
+    }
+
+    let otp = generate_otp();
+    close_password_resets(&mut tx, user.id).await?;
+    create_password_reset(
+        &mut tx,
+        user.id,
+        &hash_otp(user.id, &otp),
+        Utc::now() + Duration::minutes(OTP_VALID_MINUTES),
+    )
+    .await?;
+    commit(tx).await?;
+
+    // Kirim email di luar transaksi — koneksi DB tidak tertahan selama menunggu server SMTP.
+    let email = OtpEmail {
+        name: &user.full_name,
+        code: &otp,
+        valid_minutes: OTP_VALID_MINUTES,
+        label: "Reset password",
+        subject: "kode reset password Anda",
+        message: "Kami menerima permintaan untuk mengatur ulang password akun Anda. \
+                  Masukkan kode berikut di aplikasi untuk melanjutkan.",
+        ignore_note: "Tidak merasa meminta reset password? Abaikan email ini — password Anda \
+                      tidak berubah dan akun tetap aman.",
+    }
+    .render();
+    send_email(&user.email, &email.subject, email.text, email.html).await
+}
+
+#[derive(Serialize)]
+pub struct VerifyOtpResult {
+    /// Dipakai di langkah 3 (`/reset-password`). Rahasia — jangan disimpan permanen di FE.
+    pub reset_token: String,
+    pub expires_in_minutes: i64,
+}
+
+/// Langkah 2: cocokkan kode OTP. Benar -> dapat `reset_token` sekali pakai untuk langkah 3.
+pub async fn verify_otp_service(pool: &PgPool, input: VerifyOtpInput) -> Result<VerifyOtpResult, AppError> {
+    input.validate()?;
+    let email = normalize_email(&input.email);
+    let invalid = || AppError::BadRequest(INVALID_OTP_MESSAGE.to_string());
+
+    let mut tx = begin(pool).await?;
+    let user = find_user_by_email(&mut tx, &email).await?.ok_or_else(invalid)?;
+    let reset = find_latest_password_reset(&mut tx, user.id)
+        .await?
+        .filter(|r| r.verified_at.is_none() && r.otp_expires_at > Utc::now())
+        .ok_or_else(invalid)?;
+
+    if reset.attempts >= OTP_MAX_ATTEMPTS {
+        return Err(AppError::BadRequest(
+            "Terlalu banyak percobaan. Minta kode OTP baru".to_string(),
+        ));
+    }
+
+    if reset.otp_hash != hash_otp(user.id, input.otp.trim()) {
+        increment_password_reset_attempts(&mut tx, reset.id).await?;
+        commit(tx).await?;
+        let remaining = OTP_MAX_ATTEMPTS - reset.attempts - 1;
+        return Err(AppError::BadRequest(if remaining > 0 {
+            format!("Kode OTP salah. Sisa {remaining} percobaan")
+        } else {
+            "Kode OTP salah. Minta kode OTP baru".to_string()
+        }));
+    }
+
+    let reset_token = generate_reset_token();
+    mark_password_reset_verified(
+        &mut tx,
+        reset.id,
+        &sha256_hex(&reset_token),
+        Utc::now() + Duration::minutes(RESET_TOKEN_VALID_MINUTES),
+    )
+    .await?;
+    commit(tx).await?;
+
+    Ok(VerifyOtpResult {
+        reset_token,
+        expires_in_minutes: RESET_TOKEN_VALID_MINUTES,
+    })
+}
+
+/// Langkah 3: ganti password memakai `reset_token` dari langkah 2. Token hanya bisa dipakai sekali.
+pub async fn reset_password_service(pool: &PgPool, input: ResetPasswordInput) -> Result<(), AppError> {
+    input.validate()?;
+    if input.new_password != input.confirm_password {
+        return Err(AppError::BadRequest(
+            "Konfirmasi password tidak sama dengan password baru".to_string(),
+        ));
+    }
+
+    // Hash password dulu (lambat, bcrypt) sebelum membuka transaksi.
+    let hashed_password = hash_password(&input.new_password).await?;
+
+    let mut tx = begin(pool).await?;
+    let reset = find_password_reset_by_token(&mut tx, &sha256_hex(input.reset_token.trim()))
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "Sesi reset password tidak valid atau sudah kedaluwarsa. Ulangi dari awal".to_string(),
+            )
+        })?;
+
+    update_user_password(&mut tx, reset.user_id, &hashed_password).await?;
+    close_password_resets(&mut tx, reset.user_id).await?;
+    commit(tx).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod password_reset_tests {
+    use super::*;
+
+    #[test]
+    fn otp_selalu_6_digit_angka() {
+        for _ in 0..200 {
+            let otp = generate_otp();
+            assert_eq!(otp.len(), 6);
+            assert!(otp.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn hash_otp_terikat_ke_user() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(hash_otp(a, "123456"), hash_otp(a, "123456"));
+        assert_ne!(hash_otp(a, "123456"), hash_otp(b, "123456"));
+        assert_ne!(hash_otp(a, "123456"), hash_otp(a, "123457"));
+    }
+
+    #[test]
+    fn reset_token_acak_64_hex() {
+        let (a, b) = (generate_reset_token(), generate_reset_token());
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+    }
 }

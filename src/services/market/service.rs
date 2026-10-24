@@ -5,9 +5,10 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 
 use super::repository;
-use super::ticker_hub::TickerHub;
+use crate::database::{begin, commit};
+use crate::websocket::{MarketTicker, TickerHub};
 use super::types::{
-    is_valid_interval, Candle, KlinesQuery, MarketSymbol, MarketTicker, RecommendationQuery,
+    is_valid_interval, Candle, KlinesQuery, MarketSymbol, RecommendationQuery,
     ALLOWED_INTERVALS,
 };
 use crate::clients::{binance, strategy_api};
@@ -80,14 +81,11 @@ pub async fn get_symbols_service(
     offset: i64,
 ) -> Result<(Vec<MarketSymbol>, i64), AppError> {
     let (flex_params, total) = {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+        let mut tx = begin(pool).await?;
         let flex_params =
             find_all_flex_params(&mut tx, Some(SYMBOL_TYPE_PARAM), search, true, limit, offset).await?;
         let total = count_flex_params(&mut tx, Some(SYMBOL_TYPE_PARAM), search, true).await?;
-        let _ = tx.commit().await;
+        commit(tx).await?;
         (flex_params, total)
     };
 
@@ -155,7 +153,7 @@ async fn fetch_klines(
 
 /// Data chart. Halaman histori (`end_time` diisi) dilayani dari cache rentang (`repository`) yang
 /// dipakai bersama semua user & semua panjang rentang. Halaman terbaru diambil dari Redis kalau ada
-/// stream live aktif (`stream_hub`); kalau tidak, dari exchange dengan cache per request 5 detik —
+/// stream live aktif (`websocket::KlineHub`); kalau tidak, dari exchange dengan cache per request 5 detik —
 /// candle closed-nya tetap ikut mengisi cache rentang.
 pub async fn get_klines_service(
     redis: &RedisPool,
