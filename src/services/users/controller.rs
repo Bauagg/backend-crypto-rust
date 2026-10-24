@@ -7,48 +7,25 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::PgPool;
 use std::str::FromStr;
-use uuid::Uuid;
 
 use super::service::{
-    get_profile_service, login_service, register_service, update_profile_service,
-    ProfilePhotoUpload,
+    forgot_password_service, get_profile_service, login_service, register_service,
+    reset_password_service, update_profile_service, verify_otp_service, ProfilePhotoUpload,
+    FORGOT_PASSWORD_MESSAGE,
 };
-use super::types::{LoginInput, RefreshTokenInput, RegisterInput, UpdateProfileInput};
+use super::types::{
+    ForgotPasswordInput, LoginInput, RefreshTokenInput, RegisterInput, ResetPasswordInput,
+    UpdateProfileInput, VerifyOtpInput,
+};
 use crate::utils::api_response::{created, success};
 use crate::utils::app_error::AppError;
 use crate::utils::jwt::{refresh_access_token, JwtClaims};
-
-fn parse_user_id(claims: &JwtClaims) -> Result<Uuid, AppError> {
-    Uuid::parse_str(&claims.user_id).map_err(|_| AppError::Unauthorized("Token tidak valid".to_string()))
-}
-
-async fn begin_tx(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
-}
-
-async fn commit_tx(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
-}
 
 pub async fn register(
     State(pool): State<PgPool>,
     Json(body): Json<RegisterInput>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match register_service(&mut tx, body).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let result = register_service(&pool, body).await?;
     Ok(created(result, "Registrasi berhasil"))
 }
 
@@ -56,17 +33,7 @@ pub async fn login(
     State(pool): State<PgPool>,
     Json(body): Json<LoginInput>,
 ) -> Result<Response, AppError> {
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match login_service(&mut tx, body).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let result = login_service(&pool, body).await?;
     Ok(success(result, "Login berhasil"))
 }
 
@@ -74,18 +41,8 @@ pub async fn get_profile(
     State(pool): State<PgPool>,
     Extension(claims): Extension<JwtClaims>,
 ) -> Result<Response, AppError> {
-    let user_id = parse_user_id(&claims)?;
-    let mut tx = begin_tx(&pool).await?;
-
-    let result = match get_profile_service(&mut tx, user_id).await {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = tx.rollback().await;
-            return Err(err);
-        }
-    };
-
-    commit_tx(tx).await?;
+    let user_id = claims.user_uuid()?;
+    let result = get_profile_service(&pool, user_id).await?;
     Ok(success(result, "Berhasil mengambil profil"))
 }
 
@@ -168,7 +125,7 @@ pub async fn update_profile(
     Extension(claims): Extension<JwtClaims>,
     multipart: Multipart,
 ) -> Result<Response, AppError> {
-    let user_id = parse_user_id(&claims)?;
+    let user_id = claims.user_uuid()?;
     let (input, photo) = parse_update_profile_multipart(multipart).await?;
 
     // Transaksi diatur di service: verifikasi ke Binance dulu (tanpa tx), baru tulis ke DB.
@@ -182,4 +139,35 @@ pub async fn refresh_token(Json(body): Json<RefreshTokenInput>) -> Result<Respon
         json!({ "access_token": access_token }),
         "Access token berhasil diperbarui",
     ))
+}
+
+/// Lupa password langkah 1 — kirim kode OTP ke email. Body: `{ "email" }`.
+/// Selalu dijawab pesan yang sama, terdaftar atau tidak.
+pub async fn forgot_password(
+    State(pool): State<PgPool>,
+    Json(body): Json<ForgotPasswordInput>,
+) -> Result<Response, AppError> {
+    forgot_password_service(&pool, body).await?;
+    Ok(success(
+        json!({ "otp_valid_minutes": 10, "resend_after_seconds": 60 }),
+        FORGOT_PASSWORD_MESSAGE,
+    ))
+}
+
+/// Lupa password langkah 2 — cocokkan kode OTP. Body: `{ "email", "otp" }`.
+pub async fn verify_otp(
+    State(pool): State<PgPool>,
+    Json(body): Json<VerifyOtpInput>,
+) -> Result<Response, AppError> {
+    let result = verify_otp_service(&pool, body).await?;
+    Ok(success(result, "Kode OTP benar, silakan buat password baru"))
+}
+
+/// Lupa password langkah 3 — simpan password baru. Body: `{ "reset_token", "new_password", "confirm_password" }`.
+pub async fn reset_password(
+    State(pool): State<PgPool>,
+    Json(body): Json<ResetPasswordInput>,
+) -> Result<Response, AppError> {
+    reset_password_service(&pool, body).await?;
+    Ok(success(json!(null), "Password berhasil diubah, silakan login dengan password baru"))
 }

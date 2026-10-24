@@ -20,14 +20,15 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::model::TradePosition;
-use super::repository::{create_trade_positions_bulk, find_open_trade_positions};
-use super::robot_common::{
-    buy_retry_factor, close_positions_fifo, floor_to_step, min_account_value, to_decimal, to_f64,
-    SellFill, SOURCE, SYMBOL_TYPE_PARAM, SYSTEM_ACTOR, USDT_IDR_SYMBOL,
+use crate::database::{begin, commit};
+use crate::services::transactions::model::TradePosition;
+use crate::services::transactions::repository::{create_trade_positions_bulk, find_open_trade_positions};
+use super::common::{
+    average_price, base_asset, buy_retry_factor, close_positions_fifo, commission_in, fee_in_usdt, floor_to_step, min_account_value, to_decimal, to_f64,
+    SellFill, QUOTE_ASSET, SOURCE, SYMBOL_TYPE_PARAM, SYSTEM_ACTOR, USDT_IDR_SYMBOL,
 };
-use super::types::NewTradePosition;
-use crate::clients::binance::{self, OrderAmount, OrderFill, OrderResult, TradingRules};
+use crate::services::transactions::types::NewTradePosition;
+use crate::clients::binance::{self, OrderAmount, OrderResult, TradingRules};
 use crate::clients::strategy_api::{self, SignalOrder, SignalRequest};
 use crate::services::flex_params::repository::find_flex_params_by_type;
 use crate::services::users::model::User;
@@ -37,7 +38,6 @@ use crate::utils::app_error::AppError;
 use crate::utils::crypto::decrypt;
 
 const ACCOUNT_MODE: &str = "LIVE";
-const QUOTE_ASSET: &str = "USDT";
 
 /// Ringkasan 1 putaran robot live, untuk log.
 #[derive(Debug, Default)]
@@ -79,23 +79,15 @@ struct Credentials {
     api_secret: String,
 }
 
-/// Simbol pair USDT -> aset dasarnya (`BTCUSDT` -> `BTC`).
-fn base_asset(symbol: &str) -> &str {
-    symbol.strip_suffix(QUOTE_ASSET).unwrap_or(symbol)
-}
-
 /// Jalankan robot live untuk semua user aktif yang belum diproses hari ini (UTC).
 pub async fn run_live_robot(pool: &PgPool) -> Result<LiveRobotRun, AppError> {
     let today = Utc::now().date_naive();
     let yesterday = today - Duration::days(1);
 
     let users: Vec<User> = {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+        let mut tx = begin(pool).await?;
         let users = find_platform_robot_users(&mut tx).await?;
-        let _ = tx.commit().await;
+        commit(tx).await?;
         users
             .into_iter()
             .filter(|u| u.platform_robot_last_run_date != Some(today))
@@ -187,7 +179,7 @@ async fn process_user(
                 .into_iter()
                 .map(|p| (p.value_param, p.id))
                 .collect();
-        let _ = tx.commit().await;
+        commit(tx).await?;
         (positions, coin_ids)
     };
 
@@ -325,57 +317,6 @@ async fn process_user(
     })
 }
 
-async fn begin(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AppError> {
-    pool.begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))
-}
-
-async fn commit(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), AppError> {
-    tx.commit()
-        .await
-        .map_err(|_| AppError::Internal("Gagal menyimpan perubahan".to_string()))
-}
-
-/// Fee semua fill dalam USDT: fee dalam coin yang dibeli dikali harga isi, fee BNB (kalau user
-/// mengaktifkan bayar fee pakai BNB) dikali harga BNBUSDT.
-fn fee_in_usdt(fills: &[OrderFill], symbol: &str, avg_price: Decimal, prices: &HashMap<String, Decimal>) -> Decimal {
-    fills
-        .iter()
-        .map(|fill| {
-            let asset = fill.commission_asset.as_str();
-            if asset == QUOTE_ASSET {
-                fill.commission
-            } else if asset == base_asset(symbol) {
-                fill.commission * avg_price
-            } else {
-                let rate = prices.get(&format!("{asset}{QUOTE_ASSET}")).copied().unwrap_or_default();
-                if rate.is_zero() {
-                    tracing::warn!("Fee {} {asset} tidak bisa dikonversi ke USDT", fill.commission);
-                }
-                fill.commission * rate
-            }
-        })
-        .sum()
-}
-
-/// Jumlah fee yang dibayar dalam aset tertentu (mengurangi coin/USDT yang diterima).
-fn commission_in(fills: &[OrderFill], asset: &str) -> Decimal {
-    fills
-        .iter()
-        .filter(|f| f.commission_asset == asset)
-        .map(|f| f.commission)
-        .sum()
-}
-
-fn average_price(result: &OrderResult) -> Decimal {
-    if result.executed_qty.is_zero() {
-        Decimal::ZERO
-    } else {
-        result.quote_qty / result.executed_qty
-    }
-}
-
 /// Data yang sama untuk semua order 1 user dalam 1 putaran.
 struct OrderContext<'a> {
     pool: &'a PgPool,
@@ -421,8 +362,8 @@ impl OrderContext<'_> {
             return Ok(());
         }
         let spend = spend.round_dp_with_strategy(2, RoundingStrategy::ToZero);
-        if spend < rule.min_notional {
-            tracing::warn!("Robot live {}: BUY {} di bawah minimum order, dilewati", self.user.email, order.symbol);
+        if spend < rule.min_notional || rule.max_notional.is_some_and(|max| spend > max) {
+            tracing::warn!("Robot live {}: BUY {} di luar batas nilai order Binance, dilewati", self.user.email, order.symbol);
             return Ok(());
         }
 
@@ -499,8 +440,8 @@ impl OrderContext<'_> {
             (to_decimal(order.nilai_usdt) / price).min(held)
         };
         let quantity = floor_to_step(wanted, rule.step_size);
-        if quantity.is_zero() || quantity * price < rule.min_notional {
-            tracing::warn!("Robot live {}: SELL {} di bawah minimum order, dilewati", self.user.email, order.symbol);
+        if let Some(violation) = rule.market_violation(quantity, quantity * price) {
+            tracing::warn!("Robot live {}: SELL {} melanggar aturan Binance ({violation:?}), dilewati", self.user.email, order.symbol);
             return Ok(());
         }
 
@@ -539,59 +480,5 @@ impl OrderContext<'_> {
             Err(err) => self.log_unrecorded(&order.symbol, &raw, &err),
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-
-    fn d(value: &str) -> Decimal {
-        Decimal::from_str(value).unwrap()
-    }
-
-    fn fill(commission: &str, asset: &str) -> OrderFill {
-        OrderFill {
-            commission: d(commission),
-            commission_asset: asset.to_string(),
-        }
-    }
-
-    #[test]
-    fn aset_dasar_dari_simbol() {
-        assert_eq!(base_asset("BTCUSDT"), "BTC");
-        assert_eq!(base_asset("DOGEUSDT"), "DOGE");
-    }
-
-    #[test]
-    fn fee_beli_dipotong_dari_coin_dikonversi_ke_usdt() {
-        // BUY 0.001 BTC terisi di 2 harga, fee 0,1% dalam BTC.
-        let fills = vec![fill("0.0000006", "BTC"), fill("0.0000004", "BTC")];
-        let prices = HashMap::new();
-        assert_eq!(commission_in(&fills, "BTC"), d("0.000001"));
-        assert_eq!(fee_in_usdt(&fills, "BTCUSDT", d("86040"), &prices), d("0.08604"));
-    }
-
-    #[test]
-    fn fee_jual_dalam_usdt_dan_fee_bnb() {
-        let mut prices = HashMap::new();
-        prices.insert("BNBUSDT".to_string(), d("600"));
-        let fills = vec![fill("0.086", "USDT"), fill("0.0001", "BNB")];
-        assert_eq!(commission_in(&fills, "USDT"), d("0.086"));
-        // 0.086 USDT + 0.0001 BNB × 600 = 0.146
-        assert_eq!(fee_in_usdt(&fills, "BTCUSDT", d("86000"), &prices), d("0.146"));
-    }
-
-    #[test]
-    fn harga_rata_rata_dari_total_usdt() {
-        let result = OrderResult {
-            order_id: 1,
-            status: "FILLED".to_string(),
-            executed_qty: d("0.001"),
-            quote_qty: d("86.04"),
-            fills: vec![],
-        };
-        assert_eq!(average_price(&result), d("86040"));
     }
 }

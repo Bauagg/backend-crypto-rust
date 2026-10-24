@@ -4,4 +4,5 @@ pub mod bcrypt;
 pub mod crypto;
 pub mod http_client;
 pub mod jwt;
+pub mod mailer;
 pub mod query_filter;

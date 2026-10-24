@@ -2,7 +2,7 @@ use axum::Router;
 use sqlx::PgPool;
 
 use crate::services::{
-    candle_ohlcv, documents, fear_greed, flex_params, market, transactions, users,
+    candle_ohlcv, documents, fear_greed, flex_params, market, screeners, transactions, users,
 };
 
 /// Kumpulan seluruh route service didaftarkan di sini, lalu di-nest di `main.rs` di bawah prefix `/api`.
@@ -11,8 +11,10 @@ pub fn router() -> Router<PgPool> {
         .nest("/users", users::route::router())
         .nest("/files", documents::route::router())
         .nest("/flex-params", flex_params::route::router())
-        .nest("/market", market::route::router())
+        // REST market + WebSocket real-time (modul `websocket`) di prefix yang sama.
+        .nest("/market", market::route::router().merge(crate::websocket::router()))
         .nest("/candle-ohlcv", candle_ohlcv::route::router())
         .nest("/fear-greed", fear_greed::route::router())
         .nest("/transactions", transactions::route::router())
+        .nest("/screeners", screeners::route::router())
 }

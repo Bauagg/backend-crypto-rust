@@ -1,13 +1,16 @@
-use sqlx::{Postgres, Transaction};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::model::FlexParam;
 use super::repository::{
     create_flex_param, find_flex_param_by_id, find_flex_param_by_type_and_value,
-    find_flex_params_paginated, soft_delete_flex_param, update_flex_param, FlexParamScope,
+    find_flex_params_paginated, soft_delete_flex_param, update_flex_param,
 };
-use super::types::{CreateFlexParamInput, ListQueryOptions, UpdateFlexParamInput};
-use crate::services::documents::service::{delete_file_service, update_file_service, upload_file_service, UploadInput};
+use super::types::{CreateFlexParamInput, FlexParamScope, ListQueryOptions, UpdateFlexParamInput};
+use crate::database::{begin, commit, Tx};
+use crate::services::documents::service::{
+    delete_file_in_tx, update_file_in_tx, upload_file_in_tx, UploadInput,
+};
 use crate::services::documents::types::FileMetaInput;
 use crate::utils::app_error::AppError;
 use crate::utils::query_filter::{parse_filter_query, parse_sort_query, ColumnKind, FilterColumn};
@@ -20,8 +23,8 @@ pub struct PhotoUpload {
     pub bytes: Vec<u8>,
 }
 
-pub async fn create_flex_param_service(
-    tx: &mut Transaction<'_, Postgres>,
+pub async fn create_flex_param_in_tx(
+    tx: &mut Tx<'_>,
     input: CreateFlexParamInput,
     user_id: Uuid,
     created_by: &str,
@@ -46,7 +49,7 @@ pub async fn create_flex_param_service(
                 bytes: photo.bytes,
             };
             let meta = FileMetaInput::default();
-            let file = upload_file_service(tx, upload, user_id, meta, created_by).await?;
+            let file = upload_file_in_tx(tx, upload, user_id, meta, created_by).await?;
             (Some(file.id), Some(file.file_url))
         }
         None => (None, None),
@@ -65,6 +68,19 @@ pub async fn create_flex_param_service(
         created_by,
     )
     .await
+}
+
+pub async fn create_flex_param_service(
+    pool: &PgPool,
+    input: CreateFlexParamInput,
+    user_id: Uuid,
+    created_by: &str,
+    photo: Option<PhotoUpload>,
+) -> Result<FlexParam, AppError> {
+    let mut tx = begin(pool).await?;
+    let param = create_flex_param_in_tx(&mut tx, input, user_id, created_by, photo).await?;
+    commit(tx).await?;
+    Ok(param)
 }
 
 /// Kolom yang boleh dipakai di `?filter=` & `?sort=` endpoint list flex params.
@@ -88,7 +104,7 @@ const FLEX_PARAM_COLUMNS: [FilterColumn; 13] = [
 /// (`type_param` di `/type/:type_param`, `header_id` di `/header/:header_id`) tidak boleh
 /// difilter/diurutkan lagi lewat query.
 pub async fn get_flex_params_list_service(
-    tx: &mut Transaction<'_, Postgres>,
+    pool: &PgPool,
     scope: FlexParamScope<'_>,
     query: &ListQueryOptions,
     limit: i64,
@@ -107,8 +123,9 @@ pub async fn get_flex_params_list_service(
     let filters = parse_filter_query(query.filter.as_deref())?;
     let sort = parse_sort_query(query.sort.as_deref(), query.order.as_deref())?;
 
-    find_flex_params_paginated(
-        tx,
+    let mut tx = begin(pool).await?;
+    let page = find_flex_params_paginated(
+        &mut tx,
         scope,
         &filters,
         sort.as_ref(),
@@ -117,20 +134,25 @@ pub async fn get_flex_params_list_service(
         limit,
         offset,
     )
-    .await
+    .await?;
+    commit(tx).await?;
+    Ok(page)
 }
 
 pub async fn get_flex_param_by_id_service(
-    tx: &mut Transaction<'_, Postgres>,
+    pool: &PgPool,
     id: Uuid,
 ) -> Result<FlexParam, AppError> {
-    find_flex_param_by_id(tx, id)
+    let mut tx = begin(pool).await?;
+    let param = find_flex_param_by_id(&mut tx, id)
         .await?
-        .ok_or_else(|| AppError::NotFound("Flex param tidak ditemukan".to_string()))
+        .ok_or_else(|| AppError::NotFound("Flex param tidak ditemukan".to_string()))?;
+    commit(tx).await?;
+    Ok(param)
 }
 
-pub async fn update_flex_param_service(
-    tx: &mut Transaction<'_, Postgres>,
+pub async fn update_flex_param_in_tx(
+    tx: &mut Tx<'_>,
     id: Uuid,
     input: UpdateFlexParamInput,
     updated_by: &str,
@@ -169,11 +191,11 @@ pub async fn update_flex_param_service(
 
             let file = match existing.photo_id {
                 Some(file_id) => {
-                    update_file_service(tx, file_id, Some(upload), FileMetaInput::default(), updated_by)
+                    update_file_in_tx(tx, file_id, Some(upload), FileMetaInput::default(), updated_by)
                         .await?
                 }
                 None => {
-                    upload_file_service(tx, upload, existing.user_id, FileMetaInput::default(), updated_by)
+                    upload_file_in_tx(tx, upload, existing.user_id, FileMetaInput::default(), updated_by)
                         .await?
                 }
             };
@@ -200,18 +222,33 @@ pub async fn update_flex_param_service(
     .await
 }
 
+pub async fn update_flex_param_service(
+    pool: &PgPool,
+    id: Uuid,
+    input: UpdateFlexParamInput,
+    updated_by: &str,
+    photo: Option<PhotoUpload>,
+) -> Result<FlexParam, AppError> {
+    let mut tx = begin(pool).await?;
+    let param = update_flex_param_in_tx(&mut tx, id, input, updated_by, photo).await?;
+    commit(tx).await?;
+    Ok(param)
+}
+
 pub async fn delete_flex_param_service(
-    tx: &mut Transaction<'_, Postgres>,
+    pool: &PgPool,
     id: Uuid,
     deleted_by: &str,
 ) -> Result<(), AppError> {
-    let existing = find_flex_param_by_id(tx, id)
+    let mut tx = begin(pool).await?;
+    let existing = find_flex_param_by_id(&mut tx, id)
         .await?
         .ok_or_else(|| AppError::NotFound("Flex param tidak ditemukan".to_string()))?;
 
     if let Some(photo_id) = existing.photo_id {
-        delete_file_service(tx, photo_id, deleted_by).await?;
+        delete_file_in_tx(&mut tx, photo_id, deleted_by).await?;
     }
 
-    soft_delete_flex_param(tx, id, deleted_by).await
+    soft_delete_flex_param(&mut tx, id, deleted_by).await?;
+    commit(tx).await
 }

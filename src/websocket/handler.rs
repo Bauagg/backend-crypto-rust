@@ -1,16 +1,64 @@
+//! Endpoint WebSocket untuk FE + relay pesan dari hub ke client.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::Query;
+use axum::response::Response;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
 
-use super::stream_hub::KlineHub;
+use super::kline_hub::KlineHub;
 use super::ticker_hub::TickerHub;
-use super::types::{MarketTicker, WsTickersRequest};
+use super::types::{MarketTicker, WsKlineQuery, WsTickersQuery, WsTickersRequest};
+use crate::services::market::types::is_valid_interval;
+use crate::utils::app_error::AppError;
 
 /// Maksimal simbol yang dipantau 1 client — sama dengan batas `limit` halaman daftar coin.
 const MAX_WATCHED_SYMBOLS: usize = 100;
+
+/// Upgrade koneksi HTTP jadi WebSocket, lalu kirim candle live ke client lewat `KlineHub`
+/// (1 koneksi ke exchange per simbol+interval, dipakai bersama semua client).
+/// Contoh: GET /api/market/ws?symbol=BTCUSDT&interval=1m (upgrade header WebSocket).
+pub async fn ws_klines(
+    ws: WebSocketUpgrade,
+    Extension(hub): Extension<Arc<KlineHub>>,
+    Query(query): Query<WsKlineQuery>,
+) -> Result<Response, AppError> {
+    if query.symbol.trim().is_empty() {
+        return Err(AppError::BadRequest("symbol wajib diisi".to_string()));
+    }
+
+    let interval = query.interval.unwrap_or_else(|| "1m".to_string());
+    if !is_valid_interval(&interval) {
+        return Err(AppError::BadRequest("interval tidak valid".to_string()));
+    }
+
+    let symbol = query.symbol.trim().to_uppercase();
+
+    Ok(ws.on_upgrade(move |socket| relay_kline_stream(socket, hub, symbol, interval)))
+}
+
+/// Upgrade ke WebSocket harga live daftar coin (`TickerHub`: 1 koneksi exchange untuk semua coin
+/// & semua client). Simbol awal opsional lewat query; ganti kapan saja dengan pesan
+/// `{"symbols":["BTCUSDT","ETHUSDT"]}`.
+/// Contoh: GET /api/market/ws/tickers?symbols=BTCUSDT,ETHUSDT (upgrade header WebSocket).
+pub async fn ws_tickers(
+    ws: WebSocketUpgrade,
+    Extension(hub): Extension<Arc<TickerHub>>,
+    Query(query): Query<WsTickersQuery>,
+) -> Response {
+    let initial: Vec<String> = query
+        .symbols
+        .unwrap_or_default()
+        .split(',')
+        .map(str::to_string)
+        .collect();
+
+    ws.on_upgrade(move |socket| relay_ticker_stream(socket, hub, initial))
+}
 
 /// Kirim candle live (update tiap ±1-2 detik, candle bergerak real-time) ke client kita. Data
 /// diambil dari `KlineHub` — 1 koneksi ke exchange per simbol+interval dipakai bersama semua

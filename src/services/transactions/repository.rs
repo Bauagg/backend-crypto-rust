@@ -331,3 +331,26 @@ pub async fn reduce_trade_position(
     .await?;
     Ok(())
 }
+
+/// Semua posisi OPEN 1 coin milik user di 1 mode akun — manual maupun robot — terlama dulu (FIFO).
+pub async fn find_open_positions_by_symbol(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    account_mode: &str,
+    symbol: &str,
+) -> Result<Vec<TradePosition>, AppError> {
+    let positions = sqlx::query_as::<_, TradePosition>(
+        r#"
+        SELECT * FROM trade_positions
+        WHERE user_id = $1 AND account_mode = $2 AND symbol = $3 AND status = 'OPEN'
+          AND deleted_at IS NULL
+        ORDER BY opened_at ASC, created_at ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(account_mode)
+    .bind(symbol)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(positions)
+}

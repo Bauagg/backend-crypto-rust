@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as UpstreamMessage;
 
 use super::types::MarketTicker;
+use crate::database::{begin, commit};
 use crate::clients::binance;
 use crate::services::flex_params::repository::find_flex_params_by_type;
 use crate::utils::app_error::AppError;
@@ -169,12 +170,9 @@ impl TickerHub {
 
 /// Simbol aktif (`SIMBOL_CRYPTO`, tidak dihapus, `is_active`) — maksimal `MAX_STREAMS`.
 async fn load_symbols(pool: &PgPool) -> Result<HashSet<String>, AppError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|_| AppError::Internal("Gagal memulai transaksi".to_string()))?;
+    let mut tx = begin(pool).await?;
     let params = find_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM, true).await?;
-    let _ = tx.commit().await;
+    commit(tx).await?;
 
     Ok(params
         .into_iter()

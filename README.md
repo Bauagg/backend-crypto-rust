@@ -27,11 +27,19 @@ src/
 │   ├── users/             register, login, profil, API key Binance
 │   ├── documents/         upload file (disimpan di folder PATH_FILE_UPLOAD)
 │   ├── flex_params/       parameter fleksibel, termasuk daftar coin (SIMBOL_CRYPTO)
-│   ├── coin_symbols/      worker: sinkron daftar coin dengan Binance + CoinGecko
-│   ├── candle_ohlcv/      worker: kumpulkan candle harian (1d) ke DB
-│   ├── fear_greed/        worker: kumpulkan Fear & Greed Index ke DB
-│   └── market/            harga, chart (cache Redis), candle live (WebSocket hub), rekomendasi
-├── database/            PgPool + migration otomatis, pool Redis
+│   ├── coin_symbols/      sinkron daftar coin dengan Binance + CoinGecko
+│   ├── candle_ohlcv/      candle harian (1d) di DB
+│   ├── fear_greed/        Fear & Greed Index di DB
+│   ├── transactions/      posisi trading, BUY/SELL manual, kepemilikan coin, dashboard
+│   ├── screeners/         strategi screening user (user_screeners) + menjalankan screening
+│   ├── screener_rules/    indikator + kondisi di dalam strategi (user_screener_rules), skor per rule
+│   └── market/            daftar coin + harga, chart REST (cache Redis), rekomendasi
+├── indicator/           rumus indikator teknikal, 1 file = 1 indikator (nama = value_param INDICATORS di flex_params)
+├── robot/               mesin robot trading harian: demo.rs, live.rs, common.rs (hitungan order bersama)
+├── websocket/           SEMUA WebSocket real-time: hub chart (KlineHub) & harga live (TickerHub)
+├── template/            template email yang dipakai ulang (mis. OtpEmail: kata-katanya lewat parameter)
+├── worker/              SEMUA job background terdaftar di sini (lihat "Worker" di bawah)
+├── database/            PgPool + migration otomatis, pool Redis, helper transaksi (begin/commit/Tx)
 ├── middlewares/         authenticate (JWT Bearer)
 ├── router/              gabungan route semua service di bawah /api
 ├── config/              logger (console + logs/)
@@ -47,11 +55,81 @@ services/<modul>/
 ├── service.rs      logika bisnis
 ├── repository.rs   akses data (Postgres, atau Redis seperti di market)
 ├── model.rs        struct tabel
-├── types.rs        struct request/response
-└── worker.rs       job background (kalau ada), dijalankan dari main.rs
+└── types.rs        struct request/response
 ```
 
 Pemanggilan API luar **tidak** ditulis di service — selalu lewat `src/clients/`.
+
+### Aturan kode (wajib diikuti supaya tidak campur aduk)
+
+**1. Tiap lapisan punya 1 tugas** — alur request: `route → controller → service → repository`.
+
+| File | Boleh | Tidak boleh |
+|---|---|---|
+| `route.rs` | path + middleware | logika apa pun |
+| `controller.rs` | ambil input HTTP (path, query, body JSON, multipart, token lewat `claims.user_uuid()`), panggil **1** fungsi service, bungkus respons (`success`/`created`/`paginated`) | membuka transaksi DB, query DB, panggil `clients/`, hitungan bisnis |
+| `service.rs` | logika bisnis, validasi, **memegang transaksi DB** (`database::begin`/`commit`), panggil `clients/` | menulis SQL, membaca `axum` request |
+| `repository.rs` | SQL saja, menerima `&mut Transaction` dari service | logika bisnis, panggil API luar |
+| `model.rs` / `types.rs` | struct baris tabel / struct request & response | fungsi yang mengakses DB/API |
+
+**2. Transaksi DB** — dibuka di service, sesingkat mungkin:
+- Fungsi service untuk controller menerima `pool: &PgPool` dan dinamai `<aksi>_service`.
+- Fungsi yang dipanggil service **modul lain** di dalam transaksi pemanggil menerima `tx: &mut Tx`
+  dan dinamai `<aksi>_in_tx` (mis. `documents::upload_file_in_tx` dipakai upload foto profil).
+- Jangan menahan transaksi saat menunggu hal lambat: panggilan Binance/API luar, hash bcrypt,
+  kirim email — kerjakan sebelum `begin` atau setelah `commit`.
+- Tidak perlu `rollback()` manual: transaksi yang tidak di-`commit` (keluar lewat `?`) otomatis
+  di-rollback.
+
+**3. Folder di luar `services/` — masing-masing 1 jenis tugas:**
+
+| Folder | Isinya | Aturan |
+|---|---|---|
+| `clients/` | panggilan HTTP/WS ke API luar | tidak menyentuh DB |
+| `worker/` | **jadwal** job background | cukup memanggil 1 fungsi (service/robot) + log hasil; logikanya tidak di sini |
+| `robot/` | mesin robot harian | dipanggil worker `robot`; hitungan eksekusi order yang dipakai juga oleh BUY/SELL manual ada di `robot/common.rs` |
+| `websocket/` | koneksi real-time ke FE + stream Binance | baca data lewat repository/service modul lain; tidak menulis DB |
+| `indicator/` | rumus indikator (RSI, MACD, ...) | hitungan murni tanpa DB/API; 1 file per indikator, nama file = `value_param` INDICATORS di flex_params |
+| `template/` | HTML/teks email | tanpa I/O — kata-kata dari parameter |
+| `database/` | koneksi Postgres/Redis, helper transaksi | |
+| `utils/` | helper umum tanpa pengetahuan fitur (response, error, JWT, enkripsi, mailer) | tidak boleh import dari `services/` |
+
+**4. Fitur baru, taruh di mana?**
+- Endpoint REST baru → `services/<modul>/` (pola di atas).
+- Job terjadwal → logika di service/robot, jadwalnya `worker/<fitur>.rs` + daftarkan di `WORKERS`.
+- Stream real-time → `websocket/`, daftarkan di `websocket::router()`.
+- API pihak ketiga baru → `clients/<nama>.rs`.
+- Indikator baru (mis. ZigZag) → `indicator/zigzag.rs` + test, daftarkan `mod` & varian
+  `IndicatorKind` di `indicator/mod.rs`, lalu tambahkan baris `INDICATORS` di flex_params.
+
+### Worker
+
+Semua job background didaftarkan di satu tempat, `src/worker/mod.rs` (`WORKERS`), dan dijalankan
+dengan cara yang sama: error/panic satu worker hanya dicatat (server & worker lain tetap jalan),
+dan putaran berikutnya baru mulai setelah putaran sebelumnya selesai (tidak tumpang tindih).
+
+| Worker | File | Jadwal |
+|---|---|---|
+| `coin-symbols` | `worker/coin_symbols.rs` | saat start (duluan, `prepare`) + tiap 24 jam |
+| `candle-ohlcv` | `worker/candle_ohlcv.rs` | saat start + tiap xx:00:30 & xx:30:30 UTC |
+| `fear-greed` | `worker/fear_greed.rs` | saat start + tiap 6 jam |
+| `robot` | `worker/robot.rs` | tiap hari 00:45 UTC, coba ulang tiap 15 menit s/d 22:00 UTC |
+
+Worker cukup memanggil service/robot — logikanya tetap di `services/<modul>/service.rs` atau
+`robot/`. Menambah worker:
+buat `src/worker/<fitur>.rs` berisi `pub const WORKER`, lalu tambahkan ke `WORKERS`.
+
+### WebSocket
+
+Semua koneksi real-time ada di `src/websocket/`. `websocket/mod.rs` membuat hub, menjalankan stream
+yang harus hidup terus, dan mendaftarkan endpoint; `main.rs` cukup memanggil `websocket::start`.
+
+| Endpoint (FE) | Hub | Koneksi ke Binance |
+|---|---|---|
+| `WS /api/market/ws?symbol=BTCUSDT&interval=1h` (chart) | `kline_hub.rs` | 1 per simbol+interval yang sedang ditonton, ditutup otomatis kalau tidak ada yang menonton |
+| `WS /api/market/ws/tickers?symbols=BTCUSDT,ETHUSDT` (daftar coin) | `ticker_hub.rs` | 1 untuk semua coin aktif, jalan terus sejak server start |
+
+Di domain HTTPS pakai `wss://`, di lokal `ws://`.
 
 ## Requirement
 
@@ -147,6 +225,9 @@ Base URL: `http://localhost:<PORT>/api`. Format respons sukses:
 | PUT / DELETE | `/flex-params/:id` | ubah / hapus (soft delete) |
 | POST | `/files/upload` | upload file |
 | GET / PUT / DELETE | `/files/:id` | lihat / ganti / hapus file |
+| GET / PUT / DELETE | `/screeners` | strategi screening user — 1 user = 1 strategi; PUT membuat atau mengganti seluruh isinya (1–8 indikator) |
+| GET | `/screeners/results` | jalankan screening: 7–20 coin skor tertinggi (0–100) dari candle harian, tidak disimpan |
+| POST | `/screeners/ai-chat` | chat dengan asisten AI (9router) untuk menyusun / mengubah strategi; balik `reply` + `draft` siap dikirim ke PUT `/screeners`, tidak menyimpan apa pun |
 
 Tes WebSocket di Postman: **New → WebSocket**, isi `ws://localhost:<PORT>/api/market/ws?symbol=BTCUSDT&interval=1m`, lalu **Connect**.
 

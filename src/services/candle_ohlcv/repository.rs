@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use super::model::CandleOhlcv;
 use super::types::NewCandle;
@@ -133,4 +133,44 @@ pub async fn find_last_two_closes(
         }
     }
     Ok(closes)
+}
+
+/// `limit` candle terakhir untuk BANYAK simbol dalam 1 query, per simbol terurut lama->baru —
+/// dipakai screener menghitung indikator. Sama seperti `find_last_two_closes`: `LATERAL ... LIMIT`
+/// membaca index `(symbol, interval, open_time)` mundur, tidak memindai seluruh histori.
+pub async fn find_recent_candles(
+    tx: &mut Transaction<'_, Postgres>,
+    symbols: &[String],
+    interval: &str,
+    limit: i64,
+) -> Result<HashMap<String, Vec<CandleOhlcv>>, AppError> {
+    if symbols.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, CandleOhlcv>(
+        r#"
+        SELECT c.*
+        FROM unnest($1::text[]) AS s(symbol)
+        CROSS JOIN LATERAL (
+            SELECT * FROM candle_ohlcv
+            WHERE symbol = s.symbol AND interval = $2
+            ORDER BY open_time DESC
+            LIMIT $3
+        ) c
+        "#,
+    )
+    .bind(symbols)
+    .bind(interval)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut by_symbol: HashMap<String, Vec<CandleOhlcv>> = HashMap::new();
+    for candle in rows {
+        by_symbol.entry(candle.symbol.clone()).or_default().push(candle);
+    }
+    for candles in by_symbol.values_mut() {
+        candles.sort_by_key(|c| c.open_time);
+    }
+    Ok(by_symbol)
 }

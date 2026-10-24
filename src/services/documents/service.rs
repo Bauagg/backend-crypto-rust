@@ -1,9 +1,10 @@
-use sqlx::{Postgres, Transaction};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::model::FileRecord;
 use super::repository::{create_file, find_file_by_id, soft_delete_file, update_file};
 use super::types::FileMetaInput;
+use crate::database::{begin, commit, Tx};
 use crate::utils::app_error::AppError;
 
 fn upload_dir() -> std::path::PathBuf {
@@ -62,16 +63,17 @@ pub struct UploadInput {
     pub bytes: Vec<u8>,
 }
 
-pub async fn upload_file_service(
-    tx: &mut Transaction<'_, Postgres>,
+/// Simpan file ke disk lalu catat di DB (transaksi milik pemanggil — dipakai service lain, mis.
+/// foto flex param / profil). Gagal mencatat -> file di disk dihapus lagi supaya tidak yatim.
+pub async fn upload_file_in_tx(
+    tx: &mut Tx<'_>,
     upload: UploadInput,
     user_id: Uuid,
     meta: FileMetaInput,
     created_by: &str,
 ) -> Result<FileRecord, AppError> {
     let file_url = save_file_to_disk(&upload.original_name, &upload.bytes).await?;
-
-    create_file(
+    let recorded = create_file(
         tx,
         &upload.original_name,
         &file_url,
@@ -80,20 +82,16 @@ pub async fn upload_file_service(
         &meta,
         created_by,
     )
-    .await
+    .await;
+    if recorded.is_err() {
+        delete_file_from_disk(&file_url).await;
+    }
+    recorded
 }
 
-pub async fn get_file_service(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-) -> Result<FileRecord, AppError> {
-    find_file_by_id(tx, id)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Dokumen tidak ditemukan".to_string()))
-}
-
-pub async fn update_file_service(
-    tx: &mut Transaction<'_, Postgres>,
+/// Ganti file (opsional) & metadata dokumen, di dalam transaksi pemanggil.
+pub async fn update_file_in_tx(
+    tx: &mut Tx<'_>,
     id: Uuid,
     new_upload: Option<UploadInput>,
     meta: FileMetaInput,
@@ -120,17 +118,54 @@ pub async fn update_file_service(
     update_file(tx, id, &file_name, &file_url, &file_type, &meta, updated_by).await
 }
 
-pub async fn delete_file_service(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    deleted_by: &str,
-) -> Result<(), AppError> {
+/// Soft delete dokumen + hapus file fisiknya, di dalam transaksi pemanggil.
+pub async fn delete_file_in_tx(tx: &mut Tx<'_>, id: Uuid, deleted_by: &str) -> Result<(), AppError> {
     let existing = find_file_by_id(tx, id)
         .await?
         .ok_or_else(|| AppError::NotFound("Dokumen tidak ditemukan".to_string()))?;
 
     soft_delete_file(tx, id, deleted_by).await?;
     delete_file_from_disk(&existing.file_url).await;
-
     Ok(())
+}
+
+pub async fn upload_file_service(
+    pool: &PgPool,
+    upload: UploadInput,
+    user_id: Uuid,
+    meta: FileMetaInput,
+    created_by: &str,
+) -> Result<FileRecord, AppError> {
+    let mut tx = begin(pool).await?;
+    let file = upload_file_in_tx(&mut tx, upload, user_id, meta, created_by).await?;
+    commit(tx).await?;
+    Ok(file)
+}
+
+pub async fn get_file_service(pool: &PgPool, id: Uuid) -> Result<FileRecord, AppError> {
+    let mut tx = begin(pool).await?;
+    let file = find_file_by_id(&mut tx, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Dokumen tidak ditemukan".to_string()))?;
+    commit(tx).await?;
+    Ok(file)
+}
+
+pub async fn update_file_service(
+    pool: &PgPool,
+    id: Uuid,
+    new_upload: Option<UploadInput>,
+    meta: FileMetaInput,
+    updated_by: &str,
+) -> Result<FileRecord, AppError> {
+    let mut tx = begin(pool).await?;
+    let file = update_file_in_tx(&mut tx, id, new_upload, meta, updated_by).await?;
+    commit(tx).await?;
+    Ok(file)
+}
+
+pub async fn delete_file_service(pool: &PgPool, id: Uuid, deleted_by: &str) -> Result<(), AppError> {
+    let mut tx = begin(pool).await?;
+    delete_file_in_tx(&mut tx, id, deleted_by).await?;
+    commit(tx).await
 }

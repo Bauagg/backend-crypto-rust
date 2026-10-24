@@ -119,3 +119,43 @@ pub struct UpdateProfileInput {
     /// Mata uang pilihan: `IDR` | `USDT` (dicek di service).
     pub preferred_currency: Option<String>,
 }
+
+/// Langkah 1 lupa password: minta kode OTP ke email.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ForgotPasswordInput {
+    #[validate(email(message = "Format email tidak valid"))]
+    pub email: String,
+}
+
+/// Langkah 2: cocokkan kode OTP 6 digit dari email.
+#[derive(Debug, Deserialize, Validate)]
+pub struct VerifyOtpInput {
+    #[validate(email(message = "Format email tidak valid"))]
+    pub email: String,
+
+    #[validate(length(equal = 6, message = "Kode OTP harus 6 digit"))]
+    #[validate(custom(function = "validate_otp_numeric"))]
+    pub otp: String,
+}
+
+fn validate_otp_numeric(otp: &str) -> Result<(), validator::ValidationError> {
+    if otp.chars().all(|c| c.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(validator::ValidationError::new("otp_numeric")
+            .with_message("Kode OTP hanya boleh angka".into()))
+    }
+}
+
+/// Langkah 3: simpan password baru memakai `reset_token` dari langkah 2.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ResetPasswordInput {
+    #[validate(length(min = 1, message = "reset_token wajib diisi"))]
+    pub reset_token: String,
+
+    #[validate(length(min = 8, message = "Password baru minimal 8 karakter"))]
+    pub new_password: String,
+
+    #[validate(length(min = 1, message = "Konfirmasi password wajib diisi"))]
+    pub confirm_password: String,
+}
