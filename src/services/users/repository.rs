@@ -112,6 +112,15 @@ pub async fn update_user(
     Ok(user)
 }
 
+/// Beberapa user sekaligus (mis. nama penjual di Store).
+pub async fn find_users_by_ids(tx: &mut Transaction<'_, Postgres>, ids: &[Uuid]) -> Result<Vec<User>, AppError> {
+    let users = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ANY($1)")
+        .bind(ids)
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(users)
+}
+
 /// Semua user yang robot demo-nya aktif.
 pub async fn find_demo_robot_users(
     tx: &mut Transaction<'_, Postgres>,
@@ -200,7 +209,9 @@ pub async fn reset_platform_initial_capital(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE users SET platform_initial_capital = NULL WHERE id = $1")
+    sqlx::query(
+        "UPDATE users SET platform_initial_capital = NULL, platform_robot_awaiting_recovery = false WHERE id = $1",
+    )
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
@@ -212,10 +223,52 @@ pub async fn reset_demo_initial_capital(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE users SET demo_initial_capital = NULL WHERE id = $1")
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET demo_initial_capital = NULL, demo_robot_awaiting_recovery = false WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Simpan batas modal robot (persen saldo, 1–100) DEMO & LIVE.
+pub async fn update_robot_capital_percent(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    demo_percent: Decimal,
+    platform_percent: Decimal,
+) -> Result<User, AppError> {
+    let user = sqlx::query_as::<_, User>(
+        r#"
+        UPDATE users
+        SET demo_robot_capital_percent = $1, platform_robot_capital_percent = $2, updated_at = now()
+        WHERE id = $3 AND deleted_at IS NULL
+        RETURNING *
+        "#,
+    )
+    .bind(demo_percent)
+    .bind(platform_percent)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("User tidak ditemukan".to_string()))?;
+    Ok(user)
+}
+
+/// Tandai / hapus status "menunggu recovery" robot 1 mode akun (`DEMO` | `LIVE`) — lihat
+/// `User::demo_robot_awaiting_recovery`.
+pub async fn set_robot_awaiting_recovery(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    account_mode: &str,
+    awaiting: bool,
+) -> Result<(), AppError> {
+    let query = match account_mode {
+        "DEMO" => "UPDATE users SET demo_robot_awaiting_recovery = $1, updated_at = now() WHERE id = $2",
+        _ => "UPDATE users SET platform_robot_awaiting_recovery = $1, updated_at = now() WHERE id = $2",
+    };
+    sqlx::query(query).bind(awaiting).bind(user_id).execute(&mut **tx).await?;
     Ok(())
 }
 

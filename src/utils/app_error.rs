@@ -13,8 +13,7 @@ pub enum AppError {
     BadRequest(String),
     Validation(Vec<FieldError>),
     Unauthorized(String),
-    /// Siap dipakai saat ada endpoint yang membatasi akses berdasar role (mis. khusus admin).
-    #[allow(dead_code)]
+    /// Tidak punya hak, mis. memakai strategi Store yang belum dibeli/trial.
     Forbidden(String),
     NotFound(String),
     Conflict(String),

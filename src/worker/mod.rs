@@ -9,6 +9,7 @@ mod candle_ohlcv;
 mod coin_symbols;
 mod fear_greed;
 mod robot;
+mod strategy_bot;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,6 +26,7 @@ const WORKERS: &[WorkerDefinition] = &[
     candle_ohlcv::WORKER,
     fear_greed::WORKER,
     robot::WORKER,
+    strategy_bot::WORKER,
 ];
 
 pub type RunFuture = Pin<Box<dyn Future<Output = Result<RunOutcome, AppError>> + Send>>;

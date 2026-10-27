@@ -16,10 +16,49 @@ use crate::services::transactions::repository::{close_trade_position, reduce_tra
 use crate::services::transactions::types::NewTradePosition;
 
 pub(crate) const SOURCE: &str = "BOT";
+/// `trade_positions.rule_type` posisi yang dibuka robot.
+pub(crate) const RULE_TYPE: &str = "ROBOT";
 pub(crate) const SYSTEM_ACTOR: &str = "system";
 pub(crate) const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
 pub(crate) const USDT_IDR_SYMBOL: &str = "USDTIDR";
 pub(crate) const QUOTE_ASSET: &str = "USDT";
+
+/// Modal yang boleh dipakai robot dari 1 akun (lihat migration 0018).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RobotCapital {
+    /// Kas (USDT) yang boleh dipakai robot untuk BUY.
+    pub cash: Decimal,
+    /// Modal robot yang dikirim ke /signal (`modal`): coin robot + kas robot, maksimal batasnya.
+    pub equity: Decimal,
+}
+
+/// Modal robot = `percent`% × (kas + nilai coin robot). Kas robot = modal − nilai coin robot (tidak
+/// kurang dari 0, tidak lebih dari kas yang ada). Kalau nilai coin robot sudah melebihi batas
+/// (harga naik / persen diturunkan), modal tetap dipotong ke batas — rebalance berikutnya Python
+/// menjual kelebihannya. 100% (default) = seluruh kas + coin robot jadi modal, sama dengan aturan
+/// bot Python apa adanya.
+pub(crate) fn robot_capital(cash: Decimal, holdings_value: Decimal, percent: Decimal) -> RobotCapital {
+    let percent = percent.clamp(Decimal::ZERO, Decimal::ONE_HUNDRED);
+    let limit = (cash + holdings_value) * percent / Decimal::ONE_HUNDRED;
+    let robot_cash = (limit - holdings_value).max(Decimal::ZERO).min(cash);
+    RobotCapital {
+        cash: robot_cash,
+        equity: (holdings_value + robot_cash).min(limit),
+    }
+}
+
+/// Awalan alasan rebalance Python saat coin yang dipegang tidak sesuai target.
+const POSITION_MISMATCH_REASON: &str = "posisi tidak sesuai target";
+
+/// `true` = robot sedang "menunggu recovery" (user menjual manual coin milik robot) dan rebalance
+/// hari ini HANYA karena posisi tidak sesuai target — order dilewati, tunggu rebalance terjadwal
+/// strategi (bulanan / filter pasar berubah / kill switch).
+pub(crate) fn waits_for_recovery(awaiting_recovery: bool, kill_switch: bool, reasons: &[String]) -> bool {
+    awaiting_recovery
+        && !kill_switch
+        && !reasons.is_empty()
+        && reasons.iter().all(|reason| reason.starts_with(POSITION_MISMATCH_REASON))
+}
 
 /// BUY gagal karena saldo kurang -> kecilkan sedikit lalu coba sekali lagi (API_RUST.md 4.5 poin 5).
 pub(crate) fn buy_retry_factor() -> Decimal {
@@ -200,6 +239,9 @@ pub(crate) async fn close_positions_fifo(
                 symbol: position.symbol.clone(),
                 source: position.source.clone(),
                 strategy: position.strategy.clone(),
+                rule_type: position.rule_type.clone(),
+                rule_id: position.rule_id,
+                strategy_subscription_id: position.strategy_subscription_id,
                 opened_at: position.opened_at,
                 closed_at: Some(fill.at),
                 holding_days,
@@ -243,6 +285,36 @@ mod tests {
     fn floor_ke_step_size() {
         assert_eq!(floor_to_step(d("0.00058765"), d("0.00001")), d("0.00058"));
         assert_eq!(floor_to_step(d("123.9"), d("1")), d("123"));
+    }
+
+    #[test]
+    fn modal_robot_dibatasi_persen() {
+        // saldo 1000, belum punya coin, 10% -> robot pakai 100
+        let capital = robot_capital(d("1000"), d("0"), d("10"));
+        assert_eq!(capital, RobotCapital { cash: d("100"), equity: d("100") });
+        // kas 900 + coin robot 100 (pas di batas 10%) -> kas robot 0
+        let capital = robot_capital(d("900"), d("100"), d("10"));
+        assert_eq!(capital, RobotCapital { cash: d("0"), equity: d("100") });
+        // coin robot naik jadi 200 (> batas 110) -> modal dipotong ke batas
+        let capital = robot_capital(d("900"), d("200"), d("10"));
+        assert_eq!(capital, RobotCapital { cash: d("0"), equity: d("110") });
+        // 100% (default) = sama dengan aturan bot Python: seluruh kas + coin
+        let capital = robot_capital(d("50"), d("950"), d("100"));
+        assert_eq!(capital, RobotCapital { cash: d("50"), equity: d("1000") });
+    }
+
+    #[test]
+    fn tunggu_recovery_hanya_kalau_alasannya_posisi_tidak_sesuai() {
+        let mismatch = vec!["posisi tidak sesuai target: ['BNBUSDT']".to_string()];
+        let scheduled = vec![
+            "jadwal rebalance bulanan (2026-11-01 tanggal 1)".to_string(),
+            "posisi tidak sesuai target: ['BNBUSDT']".to_string(),
+        ];
+        assert!(waits_for_recovery(true, false, &mismatch));
+        assert!(!waits_for_recovery(false, false, &mismatch), "tidak sedang menunggu");
+        assert!(!waits_for_recovery(true, false, &scheduled), "ada jadwal strategi = recovery");
+        assert!(!waits_for_recovery(true, true, &mismatch), "kill switch tetap dijalankan");
+        assert!(!waits_for_recovery(true, false, &[]), "tidak ada rebalance");
     }
 
     #[test]

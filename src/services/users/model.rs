@@ -42,6 +42,16 @@ pub struct User {
     pub platform_initial_capital: Option<Decimal>,
     /// Tanggal (UTC) terakhir robot live memproses user ini (maks 1x per hari).
     pub platform_robot_last_run_date: Option<chrono::NaiveDate>,
+    /// `true` = user menjual manual coin milik robot demo — robot tidak membeli ulang / menambah
+    /// coin sampai rebalance terjadwal strategi ("recovery"). Lihat migration 0017.
+    pub demo_robot_awaiting_recovery: bool,
+    /// Sama dengan `demo_robot_awaiting_recovery`, untuk robot live.
+    pub platform_robot_awaiting_recovery: bool,
+    /// Batas persen saldo demo yang boleh dipakai robot (1–100, default 100 = seluruh saldo, sama
+    /// dengan aturan bot Python) — lihat migration 0018.
+    pub demo_robot_capital_percent: Decimal,
+    /// Sama dengan `demo_robot_capital_percent`, untuk akun live.
+    pub platform_robot_capital_percent: Decimal,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

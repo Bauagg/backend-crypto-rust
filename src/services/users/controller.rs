@@ -97,11 +97,25 @@ async fn parse_update_profile_multipart(
             "is_robot_platform_active" => {
                 input.is_robot_platform_active = parse_bool_field(field.text().await.unwrap_or_default());
             }
+            "demo_robot_capital_percent" => {
+                input.demo_robot_capital_percent =
+                    Some(parse_percent_field(&name, field.text().await.unwrap_or_default())?);
+            }
+            "platform_robot_capital_percent" => {
+                input.platform_robot_capital_percent =
+                    Some(parse_percent_field(&name, field.text().await.unwrap_or_default())?);
+            }
             _ => {}
         }
     }
 
     Ok((input, photo))
+}
+
+/// Angka persen dari form (`"10"`, `"12.5"`); bukan angka = ditolak, tidak diam-diam diabaikan.
+fn parse_percent_field(name: &str, value: String) -> Result<Decimal, AppError> {
+    Decimal::from_str(value.trim())
+        .map_err(|_| AppError::BadRequest(format!("{name} harus berupa angka 1–100")))
 }
 
 fn parse_bool_field(value: String) -> Option<bool> {
