@@ -116,6 +116,12 @@ pub struct UpdateProfileInput {
     /// Nyalakan/matikan robot trading di akun real/platform.
     pub is_robot_platform_active: Option<bool>,
 
+    /// Batas persen saldo demo yang boleh dipakai robot, 1–100 (dicek di service; 100 = seluruh
+    /// saldo, sama dengan aturan bot Python).
+    pub demo_robot_capital_percent: Option<Decimal>,
+    /// Sama dengan `demo_robot_capital_percent`, untuk akun live.
+    pub platform_robot_capital_percent: Option<Decimal>,
+
     /// Mata uang pilihan: `IDR` | `USDT` (dicek di service).
     pub preferred_currency: Option<String>,
 }

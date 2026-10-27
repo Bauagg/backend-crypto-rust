@@ -33,6 +33,9 @@ sha2 = "0.10"
 hex = "0.4"
 # Kirim email (SMTP, async tokio, TLS rustls — tidak butuh OpenSSL).
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1-rustls-tls"] }
+# Bahasa script strategi buatan user (sandbox): `sync` supaya AST bisa dijalankan di
+# `spawn_blocking`, `no_module` supaya script tidak bisa `import` file apa pun dari server.
+rhai = { version = "1.27", features = ["sync", "no_module"] }
 
 # Build produksi (`cargo build --release`): binary lebih kecil & cepat. Sengaja tanpa
 # `panic = "abort"` — panic di 1 request tidak boleh mematikan seluruh server.

@@ -1,0 +1,4 @@
+# Migration sqlx dicek pakai checksum isi file (byte per byte): akhir baris harus selalu LF di
+# semua OS. Tanpa ini git di Windows (core.autocrlf) mengubahnya jadi CRLF saat checkout ->
+# "VersionMismatch" karena checksum berbeda dengan yang tercatat di _sqlx_migrations.
+migrations/*.sql text eol=lf

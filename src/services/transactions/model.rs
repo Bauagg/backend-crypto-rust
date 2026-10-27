@@ -18,6 +18,15 @@ pub struct TradePosition {
     pub source: String,
     /// Strategi Python yang menghasilkan posisi (mis. `V23`, `BTC-60`); `None` untuk posisi manual.
     pub strategy: Option<String>,
+    /// Aturan yang menghasilkan posisi: `ROBOT` | `MANUAL` | `SCREENER` (beli dari hasil screener) |
+    /// `RECOMMENDATION` (beli dari rekomendasi coin Python).
+    pub rule_type: String,
+    /// Id aturannya — `SCREENER` = `user_screeners.id`, `STRATEGY` = `strategy_versions.id`;
+    /// `None` untuk jenis lain.
+    pub rule_id: Option<Uuid>,
+    /// Bot strategi user yang membuka posisi ini (`strategy_subscriptions.id`) — tiap bot hanya
+    /// mengelola posisinya sendiri. `None` untuk robot Python & posisi manual.
+    pub strategy_subscription_id: Option<Uuid>,
     pub opened_at: DateTime<Utc>,
     /// `None` selama posisi masih `OPEN`.
     pub closed_at: Option<DateTime<Utc>>,

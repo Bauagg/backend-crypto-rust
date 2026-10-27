@@ -11,7 +11,8 @@ use crate::utils::query_filter::{
 /// Kolom yang diisi saat insert, urutannya sama dengan bind di `create_trade_position` & `UNNEST`
 /// di `create_trade_positions_bulk` (`updated_by` diisi sama dengan `created_by`).
 const INSERT_COLUMNS: &str = "user_id, user_email, flex_param_id, symbol, source, strategy, \
-    opened_at, closed_at, holding_days, currency, usdt_idr_rate, quantity, entry_value, exit_value, \
+    rule_type, rule_id, strategy_subscription_id, opened_at, closed_at, holding_days, currency, usdt_idr_rate, quantity, \
+    entry_value, exit_value, \
     entry_price, exit_price, fee_amount, entry_order_id, exit_order_id, entry_order_response, \
     exit_order_response, pnl_amount, pnl_percent, status, result, account_capital, account_mode, \
     created_by";
@@ -31,6 +32,9 @@ pub async fn create_trade_position(
         .push_bind(input.symbol.clone())
         .push_bind(input.source.clone())
         .push_bind(input.strategy.clone())
+        .push_bind(input.rule_type.clone())
+        .push_bind(input.rule_id)
+        .push_bind(input.strategy_subscription_id)
         .push_bind(input.opened_at)
         .push_bind(input.closed_at)
         .push_bind(input.holding_days)
@@ -89,6 +93,9 @@ pub async fn create_trade_positions_bulk(
         .push_bind(inputs.iter().map(|p| p.symbol.clone()).collect::<Vec<_>>())
         .push_bind(inputs.iter().map(|p| p.source.clone()).collect::<Vec<_>>())
         .push_bind(inputs.iter().map(|p| p.strategy.clone()).collect::<Vec<_>>())
+        .push_bind(inputs.iter().map(|p| p.rule_type.clone()).collect::<Vec<_>>())
+        .push_bind(inputs.iter().map(|p| p.rule_id).collect::<Vec<_>>())
+        .push_bind(inputs.iter().map(|p| p.strategy_subscription_id).collect::<Vec<_>>())
         .push_bind(inputs.iter().map(|p| p.opened_at).collect::<Vec<_>>())
         .push_bind(inputs.iter().map(|p| p.closed_at).collect::<Vec<_>>())
         .push_bind(inputs.iter().map(|p| p.holding_days).collect::<Vec<_>>())
@@ -230,23 +237,115 @@ pub async fn find_trade_positions_for_dashboard(
 }
 
 /// Posisi OPEN 1 user untuk 1 mode akun & sumber, urut terlama dulu (FIFO saat dijual).
-pub async fn find_open_trade_positions(
+/// Posisi OPEN 1 user per jenis aturan (mis. `ROBOT` = hanya posisi robot Python, tidak termasuk
+/// bot strategi user / manual), terlama dulu (FIFO).
+pub async fn find_open_positions_by_rule(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
     account_mode: &str,
-    source: &str,
+    rule_type: &str,
 ) -> Result<Vec<TradePosition>, AppError> {
     let positions = sqlx::query_as::<_, TradePosition>(
         r#"
         SELECT * FROM trade_positions
-        WHERE user_id = $1 AND account_mode = $2 AND source = $3 AND status = 'OPEN'
+        WHERE user_id = $1 AND account_mode = $2 AND rule_type = $3 AND status = 'OPEN'
           AND deleted_at IS NULL
         ORDER BY opened_at ASC, created_at ASC
         "#,
     )
     .bind(user_id)
     .bind(account_mode)
-    .bind(source)
+    .bind(rule_type)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(positions)
+}
+
+/// Ringkasan performa asli posisi dari strategi script (`rule_type = STRATEGY`) per mode akun.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StrategyPerformanceRow {
+    pub account_mode: String,
+    pub closed_trades: i64,
+    pub wins: i64,
+    pub realized_pnl: rust_decimal::Decimal,
+    pub closed_entry_value: rust_decimal::Decimal,
+    pub open_positions: i64,
+    pub open_entry_value: rust_decimal::Decimal,
+    pub users: i64,
+    pub first_opened_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+const STRATEGY_PERFORMANCE_SELECT: &str = r#"
+    SELECT account_mode,
+        COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_trades,
+        COUNT(*) FILTER (WHERE status = 'CLOSED' AND result = 'PROFIT') AS wins,
+        COALESCE(SUM(pnl_amount) FILTER (WHERE status = 'CLOSED'), 0) AS realized_pnl,
+        COALESCE(SUM(entry_value) FILTER (WHERE status = 'CLOSED'), 0) AS closed_entry_value,
+        COUNT(*) FILTER (WHERE status = 'OPEN') AS open_positions,
+        COALESCE(SUM(entry_value) FILTER (WHERE status = 'OPEN'), 0) AS open_entry_value,
+        COUNT(DISTINCT user_id) AS users,
+        MIN(opened_at) AS first_opened_at
+    FROM trade_positions
+    WHERE deleted_at IS NULL AND rule_type = 'STRATEGY'
+"#;
+
+/// Performa asli 1 bot strategi (per mode akun).
+pub async fn strategy_performance_of_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: Uuid,
+) -> Result<Vec<StrategyPerformanceRow>, AppError> {
+    let rows = sqlx::query_as::<_, StrategyPerformanceRow>(&format!(
+        "{STRATEGY_PERFORMANCE_SELECT} AND strategy_subscription_id = $1 GROUP BY account_mode ORDER BY account_mode"
+    ))
+    .bind(subscription_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+/// Performa asli semua pemakai beberapa versi strategi (per mode akun) — statistik Store.
+pub async fn strategy_performance_of_versions(
+    tx: &mut Transaction<'_, Postgres>,
+    version_ids: &[Uuid],
+) -> Result<Vec<StrategyPerformanceRow>, AppError> {
+    let rows = sqlx::query_as::<_, StrategyPerformanceRow>(&format!(
+        "{STRATEGY_PERFORMANCE_SELECT} AND rule_id = ANY($1) GROUP BY account_mode ORDER BY account_mode"
+    ))
+    .bind(version_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+/// Performa asli posisi 1 user dari beberapa versi strategi (per mode akun).
+pub async fn strategy_performance_of_user_versions(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    version_ids: &[Uuid],
+) -> Result<Vec<StrategyPerformanceRow>, AppError> {
+    let rows = sqlx::query_as::<_, StrategyPerformanceRow>(&format!(
+        "{STRATEGY_PERFORMANCE_SELECT} AND user_id = $1 AND rule_id = ANY($2) GROUP BY account_mode ORDER BY account_mode"
+    ))
+    .bind(user_id)
+    .bind(version_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows)
+}
+
+/// Posisi OPEN milik 1 bot strategi, terlama dulu (FIFO).
+pub async fn find_open_positions_of_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: Uuid,
+) -> Result<Vec<TradePosition>, AppError> {
+    let positions = sqlx::query_as::<_, TradePosition>(
+        r#"
+        SELECT * FROM trade_positions
+        WHERE strategy_subscription_id = $1 AND status = 'OPEN' AND deleted_at IS NULL
+        ORDER BY opened_at ASC, created_at ASC
+        "#,
+    )
+    .bind(subscription_id)
     .fetch_all(&mut **tx)
     .await?;
     Ok(positions)

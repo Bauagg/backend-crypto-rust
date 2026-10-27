@@ -6,6 +6,9 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::model::UserScreener;
+use crate::clients::ai_router::ChatMessage;
+use crate::services::screener_rules::model::UserScreenerRule;
+use crate::services::screener_rules::types::{RuleScore, ScreenerRuleInput};
 
 /// Satu-satunya timeframe data screening: candle harian.
 pub const TIMEFRAME: &str = "1D";
@@ -13,9 +16,6 @@ pub const TIMEFRAME: &str = "1D";
 pub const TIMEFRAME_NOTE: &str = "Strategi ini dinilai dari data candle harian (OHLC timeframe 1D / D1). \
 Timeframe kecil (1 menit, 15 menit, 1 jam, 4 jam) belum tersedia, jadi strategi ini cocok untuk \
 swing trading harian, bukan scalping.";
-use crate::clients::ai_router::ChatMessage;
-use crate::services::screener_rules::model::UserScreenerRule;
-use crate::services::screener_rules::types::{RuleScore, ScreenerRuleInput};
 
 /// Body `PUT /api/screeners` — simpan strategi user (dibuat kalau belum ada, kalau sudah ada
 /// seluruh isinya termasuk daftar rule diganti).
