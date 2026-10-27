@@ -114,6 +114,10 @@ pub struct SignalResponse {
     pub status: String,
     pub kill_switch: KillSwitch,
     pub perlu_rebalance: bool,
+    /// Alasan rebalance, mis. "jadwal rebalance bulanan (...)", "filter pasar berubah hidup",
+    /// "kill switch aktif", "posisi tidak sesuai target: ['BNBUSDT']".
+    #[serde(default)]
+    pub alasan_rebalance: Vec<String>,
     pub order: Option<Vec<SignalOrder>>,
     #[serde(default)]
     pub catatan: Vec<String>,

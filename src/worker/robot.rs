@@ -36,10 +36,11 @@ async fn run_demo(pool: &PgPool) -> bool {
         Ok(DemoRobotRun::Done(summary)) => {
             tracing::info!(
                 "[worker:robot] demo: {} user diproses, {} posisi baru, {} posisi ditutup, \
-                 {} dimatikan (saldo kurang), {} dimatikan (kill switch), {} gagal",
+                 {} menunggu recovery, {} dimatikan (saldo kurang), {} dimatikan (kill switch), {} gagal",
                 summary.processed,
                 summary.positions_opened,
                 summary.positions_closed,
+                summary.awaiting_recovery,
                 summary.deactivated_low_balance,
                 summary.deactivated_kill_switch,
                 summary.errors
@@ -64,13 +65,14 @@ async fn run_live(pool: &PgPool) -> bool {
         Ok(LiveRobotRun::Done(summary)) => {
             tracing::info!(
                 "[worker:robot] live: {} user diproses, {} order terisi, {} order gagal, \
-                 {} posisi baru, {} posisi ditutup, {} dimatikan (saldo kurang), \
+                 {} posisi baru, {} posisi ditutup, {} menunggu recovery, {} dimatikan (saldo kurang), \
                  {} dimatikan (kill switch), {} user gagal",
                 summary.processed,
                 summary.orders_filled,
                 summary.orders_failed,
                 summary.positions_opened,
                 summary.positions_closed,
+                summary.awaiting_recovery,
                 summary.deactivated_low_balance,
                 summary.deactivated_kill_switch,
                 summary.errors

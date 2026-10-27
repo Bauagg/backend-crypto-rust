@@ -21,8 +21,12 @@ use crate::database::{begin, commit};
 use crate::robot::common;
 use crate::websocket::TickerHub;
 use crate::services::flex_params::repository::{find_flex_param_by_id, find_flex_param_by_type_and_value};
+use crate::services::screeners::repository::find_screener_of_user;
+use crate::services::strategy_subscriptions::repository::find_subscription_of_user;
 use crate::services::users::model::User;
-use crate::services::users::repository::{credit_demo_balance, debit_demo_balance, find_user_by_id};
+use crate::services::users::repository::{
+    credit_demo_balance, debit_demo_balance, find_user_by_id, set_robot_awaiting_recovery,
+};
 use crate::utils::app_error::AppError;
 use crate::utils::crypto::decrypt;
 use crate::utils::query_filter::{parse_filter_query, parse_sort_query, ColumnKind, FilterColumn};
@@ -36,12 +40,15 @@ const USDT_IDR_SYMBOL: &str = "USDTIDR";
 
 /// Kolom yang boleh dipakai di `?filter=` & `?sort=` list posisi. `user_id`/`user_email` sengaja
 /// tidak ada — list selalu dikunci ke user yang login.
-const TRADE_POSITION_COLUMNS: [FilterColumn; 28] = [
+const TRADE_POSITION_COLUMNS: [FilterColumn; 31] = [
     FilterColumn::new("id", ColumnKind::Uuid),
     FilterColumn::new("flex_param_id", ColumnKind::Uuid),
     FilterColumn::new("symbol", ColumnKind::Text),
     FilterColumn::new("source", ColumnKind::Text),
     FilterColumn::new("strategy", ColumnKind::Text),
+    FilterColumn::new("rule_type", ColumnKind::Text),
+    FilterColumn::new("rule_id", ColumnKind::Uuid),
+    FilterColumn::new("strategy_subscription_id", ColumnKind::Uuid),
     FilterColumn::new("opened_at", ColumnKind::Timestamp),
     FilterColumn::new("closed_at", ColumnKind::Timestamp),
     FilterColumn::new("holding_days", ColumnKind::Integer),
@@ -154,6 +161,59 @@ async fn live_balance(api_key: &str, api_secret: &str) -> Result<LiveBalance, Ap
 // ---------------------------------------------------------------------------------------------
 
 const MANUAL_SOURCE: &str = "MANUAL";
+/// `trade_positions.rule_type` posisi manual: beli biasa, dari hasil screener, atau dari
+/// rekomendasi coin Python (strateginya milik Python, tidak tersimpan di DB -> `rule_id` kosong).
+const MANUAL_RULE_TYPE: &str = "MANUAL";
+const SCREENER_RULE_TYPE: &str = "SCREENER";
+const RECOMMENDATION_RULE_TYPE: &str = "RECOMMENDATION";
+const STRATEGY_RULE_TYPE: &str = "STRATEGY";
+
+/// Asal keputusan BUY manual (sebelum id-nya dicek kepemilikannya).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ManualRule {
+    Manual,
+    Recommendation,
+    /// id `user_screeners`
+    Screener(Uuid),
+    /// id `strategy_subscriptions`
+    Strategy(Uuid),
+}
+
+/// `rule_type` BUY manual dari body. Kosong = ditebak dari id yang diisi (`screener_id` ->
+/// SCREENER, `strategy_subscription_id` -> STRATEGY), tanpa id = MANUAL. Id hanya boleh menyertai
+/// jenisnya sendiri, supaya data analisa tidak rancu.
+fn manual_rule(
+    rule_type: Option<&str>,
+    screener_id: Option<Uuid>,
+    subscription_id: Option<Uuid>,
+) -> Result<ManualRule, AppError> {
+    let rule_type = rule_type.map(|t| t.trim().to_uppercase()).filter(|t| !t.is_empty());
+    let rule = match (rule_type.as_deref(), screener_id, subscription_id) {
+        (None | Some(MANUAL_RULE_TYPE), None, None) => ManualRule::Manual,
+        (Some(RECOMMENDATION_RULE_TYPE), None, None) => ManualRule::Recommendation,
+        (None | Some(SCREENER_RULE_TYPE), Some(id), None) => ManualRule::Screener(id),
+        (None | Some(STRATEGY_RULE_TYPE), None, Some(id)) => ManualRule::Strategy(id),
+        (Some(SCREENER_RULE_TYPE), None, _) => {
+            return Err(AppError::BadRequest("rule_type SCREENER wajib menyertakan screener_id".to_string()));
+        }
+        (Some(STRATEGY_RULE_TYPE), _, None) => {
+            return Err(AppError::BadRequest(
+                "rule_type STRATEGY wajib menyertakan strategy_subscription_id".to_string(),
+            ));
+        }
+        (Some(MANUAL_RULE_TYPE | RECOMMENDATION_RULE_TYPE | SCREENER_RULE_TYPE | STRATEGY_RULE_TYPE) | None, _, _) => {
+            return Err(AppError::BadRequest(
+                "screener_id hanya untuk SCREENER dan strategy_subscription_id hanya untuk STRATEGY — isi salah satu".to_string(),
+            ));
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "rule_type harus MANUAL, SCREENER, RECOMMENDATION, atau STRATEGY".to_string(),
+            ));
+        }
+    };
+    Ok(rule)
+}
 
 fn rule_error(symbol: &str) -> AppError {
     AppError::BadRequest(format!("Aturan order {symbol} tidak tersedia di exchange"))
@@ -284,16 +344,37 @@ async fn create_trade_position_service(
     input: TradeInput,
 ) -> Result<TradePositionWithPhoto, AppError> {
     let account_mode = parse_account_mode(Some(&input.account_mode))?;
-    if input.amount <= Decimal::ZERO {
-        return Err(AppError::BadRequest("amount harus lebih dari 0".to_string()));
+    if input.coin_all {
+        return Err(AppError::BadRequest("coin_all hanya untuk SELL".to_string()));
     }
+    let amount = positive_amount(input.amount)?;
+    let rule = manual_rule(input.rule_type.as_deref(), input.screener_id, input.strategy_subscription_id)?;
 
-    let (user, coin) = {
+    // Beli dari hasil screener / strategi -> catat aturannya (bahan analisa strategi yang profit):
+    // SCREENER -> id screener, STRATEGY -> id versi strategi yang dipakai (performa per versi).
+    let (user, coin, rule_type, rule_id) = {
         let mut tx = begin(pool).await?;
         let user = find_user_by_id(&mut tx, user_id).await?;
         let coin = find_flex_param_by_id(&mut tx, input.flex_param_id).await?;
+        let (rule_type, rule_id) = match rule {
+            ManualRule::Manual => (MANUAL_RULE_TYPE, None),
+            ManualRule::Recommendation => (RECOMMENDATION_RULE_TYPE, None),
+            ManualRule::Screener(id) => {
+                let screener = find_screener_of_user(&mut tx, user_id)
+                    .await?
+                    .filter(|s| s.id == id)
+                    .ok_or_else(|| AppError::BadRequest("screener_id bukan strategi screening milikmu".to_string()))?;
+                (SCREENER_RULE_TYPE, Some(screener.id))
+            }
+            ManualRule::Strategy(id) => {
+                let subscription = find_subscription_of_user(&mut tx, id, user_id)
+                    .await?
+                    .ok_or_else(|| AppError::BadRequest("strategy_subscription_id bukan strategi yang kamu pakai".to_string()))?;
+                (STRATEGY_RULE_TYPE, Some(subscription.strategy_version_id))
+            }
+        };
         commit(tx).await?;
-        (user, coin)
+        (user, coin, rule_type, rule_id)
     };
     let user = user.ok_or_else(|| AppError::Unauthorized("User tidak ditemukan".to_string()))?;
 
@@ -321,8 +402,8 @@ async fn create_trade_position_service(
         AppError::BadRequest("Gagal mengambil kurs USDT/IDR dari Binance".to_string())
     })?;
     let entry_value = match currency.as_str() {
-        "IDR" => (input.amount / usdt_idr_rate).round_dp(8),
-        _ => input.amount,
+        "IDR" => (amount / usdt_idr_rate).round_dp(8),
+        _ => amount,
     };
 
     let new_row = |quantity: Decimal, cost: Decimal, price: Decimal, fee: Decimal, capital: Decimal| {
@@ -333,6 +414,9 @@ async fn create_trade_position_service(
             symbol: symbol.clone(),
             source: MANUAL_SOURCE.to_string(),
             strategy: None,
+            rule_type: rule_type.to_string(),
+            rule_id,
+            strategy_subscription_id: None,
             opened_at: chrono::Utc::now(),
             closed_at: None,
             holding_days: 0,
@@ -610,10 +694,18 @@ async fn holding_of(
     })
 }
 
-/// SELL manual 1 coin senilai `amount` — seperti robot: SEMUA posisi OPEN coin itu (manual maupun
-/// robot) dijual FIFO (terlama dulu), maksimal sebanyak yang dimiliki; posisi yang hanya terjual
-/// sebagian dipecah jadi baris CLOSED + sisa tetap OPEN. DEMO: simulasi harga pasar + fee 0,1% dari
-/// USDT, hasil bersih masuk `demo_balance`. LIVE: order MARKET asli.
+/// `amount` wajib & > 0.
+fn positive_amount(amount: Option<Decimal>) -> Result<Decimal, AppError> {
+    amount
+        .filter(|a| *a > Decimal::ZERO)
+        .ok_or_else(|| AppError::BadRequest("amount wajib diisi dan lebih dari 0".to_string()))
+}
+
+/// SELL manual 1 coin senilai `amount` (atau semuanya kalau `coin_all`) — seperti robot: SEMUA
+/// posisi OPEN coin itu (manual maupun robot) dijual FIFO (terlama dulu), maksimal sebanyak yang
+/// dimiliki; posisi yang hanya terjual sebagian dipecah jadi baris CLOSED + sisa tetap OPEN.
+/// DEMO: simulasi harga pasar + fee 0,1% dari USDT, hasil bersih masuk `demo_balance`. LIVE: order
+/// MARKET asli.
 async fn sell_trade_position_service(
     pool: &PgPool,
     user_id: Uuid,
@@ -621,9 +713,7 @@ async fn sell_trade_position_service(
     input: TradeInput,
 ) -> Result<ManualSellResult, AppError> {
     let account_mode = parse_account_mode(Some(&input.account_mode))?;
-    if input.amount <= Decimal::ZERO {
-        return Err(AppError::BadRequest("amount harus lebih dari 0".to_string()));
-    }
+    let amount = if input.coin_all { None } else { Some(positive_amount(input.amount)?) };
     let _guard = SellingGuard::acquire(format!("{user_id}:{account_mode}:{}", input.flex_param_id))?;
 
     let (user, coin, mut positions) =
@@ -644,22 +734,27 @@ async fn sell_trade_position_service(
     };
 
     // Jumlah coin yang diminta = `amount` (USDT/IDR) / harga, maksimal yang dipegang — `amount`
-    // senilai atau lebih dari semua coin = jual semua.
-    let currency = input
-        .currency
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .unwrap_or(&user.preferred_currency)
-        .to_uppercase();
-    let amount_usdt = match currency.as_str() {
-        "USDT" => input.amount,
-        "IDR" => input.amount / binance::get_price(USDT_IDR_SYMBOL).await.map_err(|_| {
-            AppError::BadRequest("Gagal mengambil kurs USDT/IDR dari Binance".to_string())
-        })?,
-        _ => return Err(AppError::BadRequest("currency harus IDR atau USDT".to_string())),
+    // senilai atau lebih dari semua coin = jual semua. `coin_all` = langsung semua.
+    let wanted = match amount {
+        None => held,
+        Some(amount) => {
+            let currency = input
+                .currency
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .unwrap_or(&user.preferred_currency)
+                .to_uppercase();
+            let amount_usdt = match currency.as_str() {
+                "USDT" => amount,
+                "IDR" => amount / binance::get_price(USDT_IDR_SYMBOL).await.map_err(|_| {
+                    AppError::BadRequest("Gagal mengambil kurs USDT/IDR dari Binance".to_string())
+                })?,
+                _ => return Err(AppError::BadRequest("currency harus IDR atau USDT".to_string())),
+            };
+            (amount_usdt / price).min(held)
+        }
     };
-    let wanted = (amount_usdt / price).min(held);
     let sell_everything = wanted >= held;
     let now = chrono::Utc::now();
 
@@ -735,6 +830,13 @@ async fn sell_trade_position_service(
             })
             .count()
     };
+    // Coin milik robot Python (rule_type ROBOT) ikut terjual -> robot "menunggu recovery": tidak
+    // membeli ulang / menambah coin sampai rebalance terjadwal (`robot::common::waits_for_recovery`).
+    // Coin bot strategi user tidak memicu ini — bot itu memutuskan dari skornya sendiri.
+    let sold_bot_coins = positions
+        .iter()
+        .take(positions_sold)
+        .any(|p| p.rule_type == common::RULE_TYPE);
 
     let recorded = async {
         let mut tx = begin(pool).await?;
@@ -743,6 +845,9 @@ async fn sell_trade_position_service(
         create_trade_positions_bulk(&mut tx, &new_rows).await?;
         if account_mode == "DEMO" {
             credit_demo_balance(&mut tx, user_id, fill.net_total.round_dp(8)).await?;
+        }
+        if sold_bot_coins {
+            set_robot_awaiting_recovery(&mut tx, user_id, &account_mode, true).await?;
         }
         commit(tx).await
     }
@@ -1157,6 +1262,27 @@ mod manual_trade_tests {
         assert!(SellingGuard::acquire("user:DEMO:BTCUSDT".to_string()).is_ok(), "coin lain tidak terpengaruh");
         drop(first);
         assert!(SellingGuard::acquire(key).is_ok(), "setelah selesai boleh lagi");
+    }
+}
+
+#[cfg(test)]
+mod manual_rule_type_tests {
+    use super::*;
+
+    #[test]
+    fn jenis_aturan_beli_manual() {
+        let id = Uuid::new_v4();
+        assert_eq!(manual_rule(None, None, None).unwrap(), ManualRule::Manual);
+        assert_eq!(manual_rule(None, Some(id), None).unwrap(), ManualRule::Screener(id));
+        assert_eq!(manual_rule(Some("screener"), Some(id), None).unwrap(), ManualRule::Screener(id));
+        assert_eq!(manual_rule(Some("RECOMMENDATION"), None, None).unwrap(), ManualRule::Recommendation);
+        assert_eq!(manual_rule(None, None, Some(id)).unwrap(), ManualRule::Strategy(id));
+        assert_eq!(manual_rule(Some("STRATEGY"), None, Some(id)).unwrap(), ManualRule::Strategy(id));
+        assert!(manual_rule(Some("SCREENER"), None, None).is_err());
+        assert!(manual_rule(Some("STRATEGY"), None, None).is_err());
+        assert!(manual_rule(Some("RECOMMENDATION"), Some(id), None).is_err());
+        assert!(manual_rule(None, Some(id), Some(id)).is_err(), "isi salah satu saja");
+        assert!(manual_rule(Some("ROBOT"), None, None).is_err(), "ROBOT hanya untuk robot");
     }
 }
 

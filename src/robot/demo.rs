@@ -14,9 +14,10 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::database::{begin, commit};
 use crate::services::transactions::model::TradePosition;
-use crate::services::transactions::repository::{create_trade_positions_bulk, find_open_trade_positions};
+use crate::services::transactions::repository::{create_trade_positions_bulk, find_open_positions_by_rule};
 use super::common::{
-    buy_retry_factor, close_positions_fifo, fee_rate, floor_to_step, min_account_value, to_decimal, to_f64,
+    RULE_TYPE,
+    robot_capital, waits_for_recovery, buy_retry_factor, close_positions_fifo, fee_rate, floor_to_step, min_account_value, to_decimal, to_f64,
     SellFill, SOURCE, SYMBOL_TYPE_PARAM, SYSTEM_ACTOR, USDT_IDR_SYMBOL,
 };
 use crate::services::transactions::types::NewTradePosition;
@@ -24,7 +25,9 @@ use crate::clients::binance::{self, TradingRules};
 use crate::clients::strategy_api::{self, SignalOrder, SignalRequest};
 use crate::services::flex_params::repository::find_flex_params_by_type;
 use crate::services::users::model::User;
-use crate::services::users::repository::{find_demo_robot_users, update_demo_robot_state};
+use crate::services::users::repository::{
+    find_demo_robot_users, set_robot_awaiting_recovery, update_demo_robot_state,
+};
 use crate::utils::app_error::AppError;
 
 const ACCOUNT_MODE: &str = "DEMO";
@@ -35,6 +38,8 @@ pub struct DemoRobotSummary {
     pub processed: usize,
     pub deactivated_low_balance: usize,
     pub deactivated_kill_switch: usize,
+    /// User yang rebalance-nya dilewati karena menunggu recovery (coin robot dijual manual).
+    pub awaiting_recovery: usize,
     pub errors: usize,
     pub positions_opened: usize,
     pub positions_closed: usize,
@@ -48,6 +53,7 @@ pub enum DemoRobotRun {
 
 enum UserOutcome {
     Traded { opened: usize, closed: usize },
+    AwaitingRecovery,
     LowBalance,
     KillSwitch { opened: usize, closed: usize },
     StaleData(String),
@@ -94,6 +100,10 @@ pub async fn run_demo_robot(pool: &PgPool) -> Result<DemoRobotRun, AppError> {
                 summary.positions_closed += closed;
                 tracing::warn!("Robot demo {}: kill switch aktif, robot dimatikan", user.email);
             }
+            Ok(UserOutcome::AwaitingRecovery) => {
+                summary.processed += 1;
+                summary.awaiting_recovery += 1;
+            }
             Ok(UserOutcome::LowBalance) => {
                 summary.deactivated_low_balance += 1;
                 tracing::warn!("Robot demo {}: saldo tidak cukup, robot dimatikan", user.email);
@@ -124,29 +134,35 @@ async fn process_user(
 ) -> Result<UserOutcome, AppError> {
     let mut tx = begin(pool).await?;
 
-    let mut positions = find_open_trade_positions(&mut tx, user.id, ACCOUNT_MODE, SOURCE).await?;
-    let mut cash = user.demo_balance;
+    let mut positions = find_open_positions_by_rule(&mut tx, user.id, ACCOUNT_MODE, RULE_TYPE).await?;
 
     let price_of = |position: &TradePosition| {
         prices.get(&position.symbol).copied().unwrap_or(position.entry_price)
     };
-    let total_value = cash + positions.iter().map(|p| p.quantity * price_of(p)).sum::<Decimal>();
+    let holdings_value: Decimal = positions.iter().map(|p| p.quantity * price_of(p)).sum();
+    let total_value = user.demo_balance + holdings_value;
+    // Robot hanya memakai `demo_robot_capital_percent`% saldo (default 100 = seluruh saldo, sama
+    // dengan aturan bot Python); sisa kas (`reserved`) tidak disentuh dan dikembalikan utuh ke
+    // `demo_balance` di akhir.
+    let capital = robot_capital(user.demo_balance, holdings_value, user.demo_robot_capital_percent);
+    let reserved = user.demo_balance - capital.cash;
+    let mut cash = capital.cash;
 
-    // Saldo tidak cukup untuk membuat order apa pun -> lewati & matikan robot.
-    if total_value < min_account_value() {
-        update_demo_robot_state(&mut tx, user.id, cash, user.demo_initial_capital, today, false).await?;
+    // Modal robot tidak cukup untuk membuat order apa pun -> lewati & matikan robot.
+    if capital.equity < min_account_value() {
+        update_demo_robot_state(&mut tx, user.id, user.demo_balance, user.demo_initial_capital, today, false).await?;
         commit(tx).await?;
         return Ok(UserOutcome::LowBalance);
     }
 
-    let initial_capital = user.demo_initial_capital.unwrap_or(total_value);
+    let initial_capital = user.demo_initial_capital.unwrap_or(capital.equity);
     let mut holdings: HashMap<String, f64> = HashMap::new();
     for position in &positions {
         *holdings.entry(position.symbol.clone()).or_default() += to_f64(position.quantity);
     }
 
     let request = SignalRequest {
-        modal: to_f64(total_value * usdt_idr_rate),
+        modal: to_f64(capital.equity * usdt_idr_rate),
         modal_awal: Some(to_f64(initial_capital * usdt_idr_rate)),
         kurs_usdt_idr: to_f64(usdt_idr_rate),
         posisi: holdings,
@@ -176,6 +192,19 @@ async fn process_user(
     if !(kill_switch || signal.perlu_rebalance) {
         orders.clear();
     }
+    let awaiting = user.demo_robot_awaiting_recovery;
+    let waiting = waits_for_recovery(awaiting, kill_switch, &signal.alasan_rebalance);
+    if waiting {
+        tracing::info!(
+            "Robot demo {}: menunggu recovery (coin robot dijual manual) — rebalance {:?} dilewati \
+             sampai rebalance terjadwal strategi",
+            user.email,
+            signal.alasan_rebalance
+        );
+        orders.clear();
+    }
+    // Rebalance terjadwal (bulanan / filter pasar / kill switch) dijalankan = recovery selesai.
+    let recovered = awaiting && !waiting && (kill_switch || signal.perlu_rebalance);
 
     let symbols: Vec<String> = orders.iter().map(|o| o.symbol.clone()).collect();
     let rules = binance::get_trading_rules(&symbols).await?;
@@ -225,16 +254,22 @@ async fn process_user(
     update_demo_robot_state(
         &mut tx,
         user.id,
-        cash.round_dp(2),
+        (cash + reserved).round_dp(2),
         Some(initial_capital),
         today,
         !kill_switch,
     )
     .await?;
+    if recovered {
+        set_robot_awaiting_recovery(&mut tx, user.id, ACCOUNT_MODE, false).await?;
+        tracing::info!("Robot demo {}: recovery — rebalance terjadwal dijalankan", user.email);
+    }
     commit(tx).await?;
 
     Ok(if kill_switch {
         UserOutcome::KillSwitch { opened, closed }
+    } else if waiting {
+        UserOutcome::AwaitingRecovery
     } else {
         UserOutcome::Traded { opened, closed }
     })
@@ -280,6 +315,9 @@ fn simulate_buy(
         flex_param_id,
         symbol: order.symbol.clone(),
         source: SOURCE.to_string(),
+        rule_type: RULE_TYPE.to_string(),
+        strategy_subscription_id: None,
+        rule_id: None,
         strategy: Some(strategy.to_string()),
         opened_at: now,
         closed_at: None,
@@ -389,6 +427,10 @@ mod tests {
             demo_robot_last_run_date: None,
             platform_initial_capital: None,
             platform_robot_last_run_date: None,
+            demo_robot_awaiting_recovery: false,
+            platform_robot_awaiting_recovery: false,
+            demo_robot_capital_percent: Decimal::ONE_HUNDRED,
+            platform_robot_capital_percent: Decimal::ONE_HUNDRED,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

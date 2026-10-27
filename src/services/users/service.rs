@@ -15,7 +15,7 @@ use super::repository::{
     close_password_resets, create_password_reset, create_user, find_latest_password_reset,
     find_password_reset_by_token, find_user_by_email, find_user_by_id, find_user_by_phone,
     increment_password_reset_attempts, mark_password_reset_verified, reset_demo_initial_capital,
-    reset_platform_initial_capital, update_user, update_user_password,
+    reset_platform_initial_capital, update_robot_capital_percent, update_user, update_user_password,
 };
 use super::types::{
     is_supported_platform, ForgotPasswordInput, LoginInput, RegisterInput, ResetPasswordInput,
@@ -62,6 +62,12 @@ pub struct UserProfile {
     pub demo_robot_last_run_date: Option<chrono::NaiveDate>,
     pub platform_initial_capital: Option<Decimal>,
     pub platform_robot_last_run_date: Option<chrono::NaiveDate>,
+    /// Batas persen saldo yang boleh dipakai robot demo / live (1–100, default 100).
+    pub demo_robot_capital_percent: Decimal,
+    pub platform_robot_capital_percent: Decimal,
+    /// `true` = robot menunggu recovery setelah user menjual manual coin milik robot.
+    pub demo_robot_awaiting_recovery: bool,
+    pub platform_robot_awaiting_recovery: bool,
 }
 
 impl From<User> for UserProfile {
@@ -85,6 +91,10 @@ impl From<User> for UserProfile {
             demo_robot_last_run_date: user.demo_robot_last_run_date,
             platform_initial_capital: user.platform_initial_capital,
             platform_robot_last_run_date: user.platform_robot_last_run_date,
+            demo_robot_capital_percent: user.demo_robot_capital_percent,
+            platform_robot_capital_percent: user.platform_robot_capital_percent,
+            demo_robot_awaiting_recovery: user.demo_robot_awaiting_recovery,
+            platform_robot_awaiting_recovery: user.platform_robot_awaiting_recovery,
         }
     }
 }
@@ -247,6 +257,14 @@ pub async fn update_profile_service(
             ));
         }
 
+    for percent in [input.demo_robot_capital_percent, input.platform_robot_capital_percent].into_iter().flatten() {
+        if percent < Decimal::ONE || percent > Decimal::ONE_HUNDRED {
+            return Err(AppError::BadRequest(
+                "Persen modal robot harus antara 1 dan 100".to_string(),
+            ));
+        }
+    }
+
     let existing = {
         let mut tx = begin(pool).await?;
         let existing = find_user_by_id(&mut tx, user_id).await?;
@@ -348,11 +366,25 @@ pub async fn update_profile_service(
         None => (existing.photo_id, existing.photo_url),
     };
 
-    // Robot diaktifkan ulang -> mulai hitungan modal awal (kill switch) yang baru.
-    if is_robot_demo_active && !existing.is_robot_demo_active {
+    let demo_percent = input
+        .demo_robot_capital_percent
+        .map(|p| p.round_dp(2))
+        .unwrap_or(existing.demo_robot_capital_percent);
+    let platform_percent = input
+        .platform_robot_capital_percent
+        .map(|p| p.round_dp(2))
+        .unwrap_or(existing.platform_robot_capital_percent);
+
+    // Robot diaktifkan ulang, atau batas modalnya diubah -> mulai hitungan modal awal (kill switch)
+    // yang baru. Tanpa reset, modal yang mengecil karena persen diturunkan terbaca sebagai rugi.
+    if (is_robot_demo_active && !existing.is_robot_demo_active)
+        || demo_percent != existing.demo_robot_capital_percent
+    {
         reset_demo_initial_capital(tx, user_id).await?;
     }
-    if is_robot_platform_active && !existing.is_robot_platform_active {
+    if (is_robot_platform_active && !existing.is_robot_platform_active)
+        || platform_percent != existing.platform_robot_capital_percent
+    {
         reset_platform_initial_capital(tx, user_id).await?;
     }
 
@@ -373,6 +405,13 @@ pub async fn update_profile_service(
         &preferred_currency,
     )
     .await?;
+    let user = if demo_percent != user.demo_robot_capital_percent
+        || platform_percent != user.platform_robot_capital_percent
+    {
+        update_robot_capital_percent(tx, user_id, demo_percent, platform_percent).await?
+    } else {
+        user
+    };
     commit(tx_owned).await?;
 
     Ok(user.into())

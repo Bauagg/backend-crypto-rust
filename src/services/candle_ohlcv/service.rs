@@ -1,16 +1,23 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Instant;
 
 use futures_util::stream::{self, StreamExt};
+use chrono::{DateTime, NaiveDate};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use super::model::CandleOhlcv;
-use super::repository::{find_candles, find_latest_open_times, insert_candles};
+use super::repository::{find_candles, find_latest_open_times, find_recent_candles, insert_candles};
 use super::types::NewCandle;
 use crate::database::{begin, commit};
 use crate::clients::binance;
-use crate::services::flex_params::repository::find_flex_param_values_with_recently_deleted;
+use crate::indicator::Candle;
+use crate::services::flex_params::model::FlexParam;
+use crate::services::flex_params::repository::{
+    find_flex_param_values_with_recently_deleted, find_flex_params_by_type,
+};
 use crate::utils::app_error::AppError;
 
 const SYMBOL_TYPE_PARAM: &str = "SIMBOL_CRYPTO";
@@ -39,6 +46,58 @@ pub async fn get_candles_service(
     end_time: Option<i64>,
 ) -> Result<Vec<CandleOhlcv>, AppError> {
     find_candles(pool, symbol, interval, limit, end_time).await
+}
+
+/// Candle harian (D1) terbaru semua coin aktif — bahan screener & strategi buatan user.
+pub struct DailyMarket {
+    pub coins: Vec<FlexParam>,
+    candles: HashMap<String, Vec<CandleOhlcv>>,
+    /// `open_time` candle terbaru di antara semua coin.
+    pub latest_open_time: Option<i64>,
+}
+
+impl DailyMarket {
+    /// Coin aktif yang candle terakhirnya = candle terbaru, beserta historinya (lama -> baru). Coin
+    /// yang tertinggal (mis. sudah tidak diperdagangkan) atau belum punya candle tidak ikut.
+    pub fn fresh_coins(&self) -> impl Iterator<Item = (&FlexParam, &[CandleOhlcv])> {
+        self.coins.iter().filter_map(|coin| {
+            let history = self.candles.get(&coin.value_param)?;
+            (history.last().map(|c| c.open_time) == self.latest_open_time && self.latest_open_time.is_some())
+                .then_some((coin, history.as_slice()))
+        })
+    }
+
+    /// Tanggal (UTC) candle terbaru.
+    pub fn candle_date(&self) -> Option<NaiveDate> {
+        self.latest_open_time.and_then(DateTime::from_timestamp_millis).map(|t| t.date_naive())
+    }
+}
+
+/// `history` candle terakhir (D1) semua coin aktif dalam 1 transaksi baca singkat.
+pub async fn load_daily_market(pool: &PgPool, history: i64) -> Result<DailyMarket, AppError> {
+    let mut tx = begin(pool).await?;
+    let coins = find_flex_params_by_type(&mut tx, SYMBOL_TYPE_PARAM, true).await?;
+    let symbols: Vec<String> = coins.iter().map(|c| c.value_param.clone()).collect();
+    let candles = find_recent_candles(&mut tx, &symbols, COLLECTOR_INTERVAL, history).await?;
+    commit(tx).await?;
+
+    let latest_open_time = candles.values().filter_map(|c| c.last()).map(|c| c.open_time).max();
+    Ok(DailyMarket { coins, candles, latest_open_time })
+}
+
+/// Candle DB (Decimal) -> candle untuk rumus indikator (f64).
+pub fn to_indicator_candles(history: &[CandleOhlcv]) -> Vec<Candle> {
+    let to_f64 = |d: Decimal| d.to_f64().unwrap_or_default();
+    history
+        .iter()
+        .map(|c| Candle {
+            open: to_f64(c.open),
+            high: to_f64(c.high),
+            low: to_f64(c.low),
+            close: to_f64(c.close),
+            volume: to_f64(c.volume),
+        })
+        .collect()
 }
 
 /// `open_time` candle harian terakhir yang sudah close (kemarin 00:00 UTC). Simbol yang sudah

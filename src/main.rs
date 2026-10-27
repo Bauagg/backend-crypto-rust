@@ -6,6 +6,7 @@ mod middlewares;
 mod robot;
 mod router;
 mod services;
+mod strategy_engine;
 mod template;
 mod utils;
 mod websocket;

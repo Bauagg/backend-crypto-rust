@@ -3,12 +3,48 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Performa asli posisi strategi per mode akun (DEMO/LIVE dipisah — jangan dicampur).
+#[derive(Debug, Clone, Serialize)]
+pub struct LivePerformance {
+    pub account_mode: String,
+    pub closed_trades: i64,
+    pub win_rate_percent: Decimal,
+    /// Untung/rugi yang sudah terealisasi (USDT).
+    pub realized_pnl: Decimal,
+    /// `realized_pnl` dibanding modal posisi yang sudah ditutup.
+    pub realized_pnl_percent: Decimal,
+    pub open_positions: i64,
+    pub open_entry_value: Decimal,
+    /// Jumlah user pemakai (untuk statistik Store).
+    pub users: i64,
+    pub first_opened_at: Option<DateTime<Utc>>,
+}
+
+impl From<super::repository::StrategyPerformanceRow> for LivePerformance {
+    fn from(row: super::repository::StrategyPerformanceRow) -> Self {
+        let percent = |part: Decimal, whole: Decimal| {
+            if whole.is_zero() { Decimal::ZERO } else { (part / whole * Decimal::ONE_HUNDRED).round_dp(2) }
+        };
+        Self {
+            win_rate_percent: percent(Decimal::from(row.wins), Decimal::from(row.closed_trades)),
+            realized_pnl_percent: percent(row.realized_pnl, row.closed_entry_value),
+            account_mode: row.account_mode,
+            closed_trades: row.closed_trades,
+            realized_pnl: row.realized_pnl.round_dp(8),
+            open_positions: row.open_positions,
+            open_entry_value: row.open_entry_value.round_dp(8),
+            users: row.users,
+            first_opened_at: row.first_opened_at,
+        }
+    }
+}
+
 /// Body `POST /api/transactions` — BUY & SELL manual, body sama. Hanya yang memang keputusan user;
 /// sisanya diisi sistem: user & email dari token, simbol dari `flex_params`, harga & kurs USDT/IDR
 /// dari Binance, modal akun dari `demo_balance` (DEMO) atau saldo Binance user (LIVE).
 /// - BUY: buka posisi baru senilai `amount` (maksimal modal akun).
 /// - SELL: jual coin senilai `amount` — posisi dipilih sistem FIFO (terlama dulu, manual maupun
-///   robot), maksimal sebanyak yang dimiliki.
+///   robot), maksimal sebanyak yang dimiliki. `coin_all: true` = jual semua coin itu (tanpa `amount`).
 #[derive(Debug, Deserialize)]
 pub struct TradeInput {
     /// `BUY` | `SELL`
@@ -18,11 +54,30 @@ pub struct TradeInput {
     /// `DEMO` | `LIVE`
     pub account_mode: String,
     /// Nilai yang dibeli/dijual dalam `currency` (> 0), mis. "30" = senilai $30. Kalau `IDR`,
-    /// dikonversi ke USDT pakai kurs Binance saat itu.
-    pub amount: Decimal,
+    /// dikonversi ke USDT pakai kurs Binance saat itu. Wajib, kecuali SELL dengan `coin_all: true`.
+    #[serde(default)]
+    pub amount: Option<Decimal>,
+    /// Khusus SELL: `true` = jual SEMUA coin ini yang dimiliki, berapa pun harganya saat order
+    /// (`amount` diabaikan) — tidak tergantung harga yang sudah bergerak sejak layar dibuka.
+    #[serde(default)]
+    pub coin_all: bool,
     /// Mata uang `amount`: `IDR` | `USDT`. Opsional — kosong = `preferred_currency` user.
     #[serde(default)]
     pub currency: Option<String>,
+    /// Asal keputusan BUY, dicatat di `trade_positions.rule_type` sebagai bahan analisa strategi
+    /// yang profit: `MANUAL` (default) | `SCREENER` (dari hasil screening, wajib `screener_id`) |
+    /// `RECOMMENDATION` (dari rekomendasi coin Python) | `STRATEGY` (dari hasil strategi script,
+    /// wajib `strategy_subscription_id`). Kosong = ditebak dari id yang diisi.
+    /// Diabaikan untuk SELL.
+    #[serde(default)]
+    pub rule_type: Option<String>,
+    /// Id strategi screener user (`GET /screeners` -> `id`) untuk `rule_type = SCREENER`.
+    #[serde(default)]
+    pub screener_id: Option<Uuid>,
+    /// Id pemakaian strategi script (`GET /strategy-subscriptions` -> `id`) untuk
+    /// `rule_type = STRATEGY` — posisi dicatat dengan `rule_id` = versi strategi yang dipakai.
+    #[serde(default)]
+    pub strategy_subscription_id: Option<Uuid>,
 }
 
 /// Query param list posisi: search simbol, filter & sort dinamis (format sama dengan flex_params),
@@ -68,6 +123,12 @@ pub struct NewTradePosition {
     pub source: String,
     /// Wajib untuk `BOT`, `None` untuk `MANUAL`.
     pub strategy: Option<String>,
+    /// `ROBOT` | `MANUAL` | `SCREENER` — lihat migration 0019.
+    pub rule_type: String,
+    /// `user_screeners.id` untuk `SCREENER`; `None` untuk `ROBOT` & `MANUAL`.
+    pub rule_id: Option<Uuid>,
+    /// Bot strategi yang membuka posisi (`strategy_subscriptions.id`); `None` selain itu.
+    pub strategy_subscription_id: Option<Uuid>,
     pub opened_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub holding_days: i32,

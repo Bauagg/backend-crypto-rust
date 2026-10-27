@@ -130,7 +130,18 @@ pub async fn post_json_with_error_body<T: DeserializeOwned>(
     headers: Headers,
     body: &(impl Serialize + ?Sized),
 ) -> Result<Result<T, ErrorResponse>, AppError> {
-    let mut request = client().post(url).timeout(Duration::from_secs(60)).json(body);
+    post_json_with_error_body_timeout(url, headers, body, Duration::from_secs(60)).await
+}
+
+/// Seperti `post_json_with_error_body` dengan batas waktu sendiri — mis. asisten AI yang menulis
+/// script panjang bisa butuh lebih dari 1 menit.
+pub async fn post_json_with_error_body_timeout<T: DeserializeOwned>(
+    url: &str,
+    headers: Headers,
+    body: &(impl Serialize + ?Sized),
+    timeout: Duration,
+) -> Result<Result<T, ErrorResponse>, AppError> {
+    let mut request = client().post(url).timeout(timeout).json(body);
     for (key, value) in headers {
         request = request.header(key, value);
     }
